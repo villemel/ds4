@@ -556,7 +556,6 @@ static bool kv_cache_incoming_supersedes_continued(
 
 static bool kv_cache_reason_is_anchor(uint8_t reason) {
     return reason == DS4_KVSTORE_REASON_COLD ||
-           reason == DS4_KVSTORE_REASON_EVICT ||
            reason == DS4_KVSTORE_REASON_SHUTDOWN;
 }
 
@@ -576,7 +575,14 @@ double ds4_kvstore_entry_eviction_score(
         effective_hits *= exp2(-elapsed / (double)DS4_KVSTORE_HIT_HALF_LIFE_SECONDS);
         if (effective_hits < KV_CACHE_MIN_EFFECTIVE_HITS) effective_hits = 0.0;
     }
-    double score = (effective_hits + 1.0) *
+    /* Age penalty: entries not used recently get lower scores regardless of
+     * hit count.  A fresh entry scores ~1.0 × density; an entry untouched for
+     * 24h scores ~0.5 × density; 48h → ~0.33 × density.  This ensures new
+     * checkpoints survive over old, stale ones when the cache is full. */
+    double age_hours = 0.0;
+    if (now > used_at) age_hours = (double)(now - used_at) / 3600.0;
+    double age_factor = 1.0 / (1.0 + age_hours / 24.0);
+    double score = (effective_hits + 1.0) * age_factor *
                    (double)e->tokens / (double)e->file_size;
     if (kv_cache_reason_is_anchor(e->reason))
         score *= KV_CACHE_ANCHOR_REASON_SCORE_FACTOR;

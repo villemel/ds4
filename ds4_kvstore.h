@@ -71,6 +71,7 @@ typedef struct {
     bool reject_different_quant;
     ds4_kvstore_options opt;
     int continued_last_store_tokens;
+    uint64_t last_sweep_ts;
     ds4_kvstore_entry *entry;
     int len;
     int cap;
@@ -158,6 +159,11 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
                        const ds4_kvstore_eviction_context *incoming);
 int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
                                  int model_id, int quant_bits, int ctx_size);
+int ds4_kvstore_find_token_prefix(ds4_kvstore *kc,
+                                  const ds4_tokens *prompt_tokens,
+                                  int model_id, int quant_bits, int ctx_size,
+                                  int min_tokens);
+void ds4_kvstore_sweep(ds4_kvstore *kc);
 
 bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         ds4_engine *engine,
@@ -190,6 +196,7 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                               ds4_engine *engine,
                               ds4_session *session,
                               const char *prompt_text,
+                              const ds4_tokens *prompt_tokens,
                               ds4_tokens *effective_prompt,
                               ds4_kvstore_load_result *result,
                               const ds4_kvstore_trailer_hooks *hooks,

@@ -54,6 +54,25 @@
  * survive comparable continued entries, while still allowing pressure and poor
  * density to evict them. */
 #define KV_CACHE_ANCHOR_REASON_SCORE_FACTOR 2.0
+/* Token-prefix fallback for resuming an interrupted session.
+ * The byte-prefix matcher keys checkpoints by the SHA-1 of the rendered token
+ * text.  When a client re-serializes the recent turns with different bytes on
+ * resume (same tokens, different spelling), that SHA stops matching the
+ * authoritative checkpoint even though its token history is still an exact
+ * token-prefix of the prompt — so the load falls back to an old waypoint and
+ * re-prefills a huge tail.  To recover we re-select the best checkpoint by its
+ * exact token list (read straight from the payload) instead of by bytes.
+ * The scan is bounded and visits the largest candidates first so the cheap
+ * byte-prefix path stays the common case. */
+#define KV_CACHE_TOKEN_PREFIX_SCAN_MAX 64
+/* Sweeper: keep at most one predecessor checkpoint below each chain's maximal
+ * checkpoint (the freshest survivor), so every chain holds max + 1 = 2 files.
+ * Anything below the predecessor is strictly dominated by a larger survivor and
+ * is worthless — delete it.  Runs right after a new checkpoint is written so it
+ * rides coat tails (incremental, not a separate scan), throttled to avoid
+ * thrash on rapid consecutive stores at a checkpoint boundary. */
+#define KV_CACHE_KEEP_PREDECESSORS 1
+#define KV_CACHE_SWEEP_MIN_INTERVAL_SECONDS 1
 
 typedef struct {
     char *ptr;
@@ -635,6 +654,9 @@ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
     kc->reject_different_quant = reject_different_quant;
     kc->opt = opt;
     ds4_kvstore_evict(kc, NULL, 0, NULL);
+    /* One-time sweep at open to collapse any dominated checkpoints that
+     * accumulated before the sweeper existed. */
+    ds4_kvstore_sweep(kc);
     kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
             "%s: KV disk cache %s (budget=%llu MiB, cross-quant=%s, min=%d, cold_max=%d, continued=%d, trim=%d, align=%d, hit_half_life=%llus)",
             kv_log_name(kc),
@@ -1151,6 +1173,10 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                 text_override ? (cache_text_key ? cache_text_key : "visible-transcript") : "token-text",
                 (double)(DS4_KVSTORE_FIXED_HEADER + 4ull + text_len + payload_bytes + trailer_bytes) / (1024.0 * 1024.0),
                 save_ms);
+        /* Sweeper rides coat tails: the new checkpoint is now the lineage max,
+         * so prune the redundant waypoints below it immediately. */
+        kv_cache_refresh(kc);
+        ds4_kvstore_sweep(kc);
     }
     ds4_session_payload_file_free(&staged);
     free(tmp);
@@ -1218,10 +1244,281 @@ int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
     return best;
 }
 
+/* Read the exact token list stored at the head of a checkpoint payload and
+ * test whether it is a token-prefix of prompt.  The ds4_session payload keeps
+ * its fixed u32 header (13 words; field 7 is the token count) immediately
+ * after the KVC text, followed by the token ids — the same layout for the
+ * GLM, CPU, and DeepSeek/Metal backends, so one reader covers every kind.
+ * Returns 1 on an exact prefix match, 0 on a mismatch, and -1 when the
+ * payload cannot be read at all (so the caller can skip the candidate rather
+ * than treat it as a miss). */
+static int ds4_kvstore_payload_token_prefix_match(const char *path,
+                                                  const ds4_tokens *prompt) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return -1;
+    ds4_kvstore_entry hdr = {0};
+    uint32_t text_bytes = 0;
+    int rc = -1;
+    if (ds4_kvstore_read_header(fp, &hdr, &text_bytes)) {
+        const long payload_off =
+            (long)(DS4_KVSTORE_FIXED_HEADER + 4ull + text_bytes);
+        uint32_t ph[DS4_SESSION_PAYLOAD_U32_FIELDS];
+        if (fseek(fp, payload_off, SEEK_SET) == 0 &&
+            fread(ph, sizeof(uint32_t), DS4_SESSION_PAYLOAD_U32_FIELDS, fp) ==
+                DS4_SESSION_PAYLOAD_U32_FIELDS &&
+            ph[0] == DS4_SESSION_PAYLOAD_MAGIC &&
+            ph[1] == DS4_SESSION_PAYLOAD_VERSION)
+        {
+            const uint32_t count = ph[7];
+            rc = 0;
+            if (count == hdr.tokens && (int64_t)count <= prompt->len) {
+                rc = 1;
+                for (uint32_t i = 0; i < count; i++) {
+                    uint32_t tok;
+                    if (fread(&tok, sizeof(tok), 1, fp) != 1) { rc = -1; break; }
+                    if ((int)tok != prompt->v[i]) { rc = 0; break; }
+                }
+            }
+        }
+    }
+    fclose(fp);
+    return rc;
+}
+
+typedef struct { int idx; uint32_t tokens; } kv_token_cand;
+
+static int kv_token_cand_cmp_desc(const void *a, const void *b) {
+    const kv_token_cand *ca = a, *cb = b;
+    if (ca->tokens > cb->tokens) return -1;
+    if (ca->tokens < cb->tokens) return 1;
+    return 0;
+}
+
+/* Find the largest checkpoint whose stored token list is an exact token-prefix
+ * of prompt_tokens.  Candidates with at most min_tokens tokens are skipped so
+ * a cheaper byte-prefix winner is never downgraded; the byte-prefix result is
+ * the floor.  Returns the best entry index, or -1. */
+int ds4_kvstore_find_token_prefix(ds4_kvstore *kc,
+                                  const ds4_tokens *prompt_tokens,
+                                  int model_id, int quant_bits, int ctx_size,
+                                  int min_tokens) {
+    if (!kc || !prompt_tokens || prompt_tokens->len <= 0) return -1;
+    kv_cache_refresh(kc);
+    const int plen = prompt_tokens->len;
+    kv_token_cand *cand = kv_xmalloc((size_t)kc->len * sizeof(kv_token_cand));
+    int ncand = 0;
+    for (int i = 0; i < kc->len; i++) {
+        ds4_kvstore_entry *e = &kc->entry[i];
+        if ((int)e->tokens <= min_tokens) continue;
+        if ((int)e->tokens > plen) continue;
+        if (e->model_id != (uint8_t)model_id) continue;
+        if ((uint32_t)ctx_size < e->ctx_size) continue;
+        if (kc->reject_different_quant &&
+            e->quant_bits != (uint8_t)quant_bits) continue;
+        cand[ncand].idx = i;
+        cand[ncand].tokens = e->tokens;
+        ncand++;
+    }
+    int best = -1;
+    if (ncand > 0) {
+        qsort(cand, (size_t)ncand, sizeof(kv_token_cand), kv_token_cand_cmp_desc);
+        if (ncand > KV_CACHE_TOKEN_PREFIX_SCAN_MAX)
+            ncand = KV_CACHE_TOKEN_PREFIX_SCAN_MAX;
+        for (int k = 0; k < ncand; k++) {
+            int i = cand[k].idx;
+            int rc = ds4_kvstore_payload_token_prefix_match(
+                kc->entry[i].path, prompt_tokens);
+            if (rc == 1) { best = i; break; }
+            if (rc == -1) {
+                kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                        "%s: kv cache token-prefix candidate unreadable tokens=%u file=%s",
+                        kv_log_name(kc), kc->entry[i].tokens,
+                        kc->entry[i].path ? kc->entry[i].path : "?");
+            }
+        }
+    }
+    free(cand);
+    return best;
+}
+
+/* Read the full token list stored at the head of a checkpoint payload.
+ * Returns 1 on success (out populated), 0 if the payload cannot be read. */
+static int ds4_kvstore_read_entry_tokens(const char *path, ds4_tokens *out) {
+    out->len = 0;
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return 0;
+    ds4_kvstore_entry hdr = {0};
+    uint32_t text_bytes = 0;
+    int rc = 0;
+    if (ds4_kvstore_read_header(fp, &hdr, &text_bytes)) {
+        const long payload_off =
+            (long)(DS4_KVSTORE_FIXED_HEADER + 4ull + text_bytes);
+        uint32_t ph[DS4_SESSION_PAYLOAD_U32_FIELDS];
+        if (fseek(fp, payload_off, SEEK_SET) == 0 &&
+            fread(ph, sizeof(uint32_t), DS4_SESSION_PAYLOAD_U32_FIELDS, fp) ==
+                DS4_SESSION_PAYLOAD_U32_FIELDS &&
+            ph[0] == DS4_SESSION_PAYLOAD_MAGIC &&
+            ph[1] == DS4_SESSION_PAYLOAD_VERSION)
+        {
+            const uint32_t count = ph[7];
+            rc = 0;
+            if (count == hdr.tokens) {
+                rc = 1;
+                for (uint32_t i = 0; i < count; i++) {
+                    uint32_t tok;
+                    if (fread(&tok, sizeof(tok), 1, fp) != 1) { rc = 0; break; }
+                    ds4_tokens_push(out, (int)tok);
+                }
+            }
+        }
+    }
+    fclose(fp);
+    return rc;
+}
+
+typedef struct {
+    int idx;
+    uint8_t model_id;
+    uint8_t quant_bits;
+    uint32_t ctx_size;
+    uint32_t tokens;
+} kv_sweep_item;
+
+static int kv_sweep_item_cmp(const void *a, const void *b) {
+    const kv_sweep_item *ia = a, *ib = b;
+    if (ia->model_id != ib->model_id) return ia->model_id < ib->model_id ? -1 : 1;
+    if (ia->quant_bits != ib->quant_bits)
+        return ia->quant_bits < ib->quant_bits ? -1 : 1;
+    if (ia->ctx_size != ib->ctx_size)
+        return ia->ctx_size < ib->ctx_size ? -1 : 1;
+    if (ia->tokens != ib->tokens) return ia->tokens > ib->tokens ? -1 : 1; /* desc */
+    return 0;
+}
+
+typedef struct {
+    int max_idx;   /* entry index of the chain's maximal checkpoint */
+    int pred_idx;  /* entry index of the kept predecessor, or -1 */
+    ds4_tokens max_tok; /* token list of the maximal checkpoint */
+} kv_chain;
+
+/* Keep at most (1 + KV_CACHE_KEEP_PREDECESSORS) checkpoints per conversation
+ * lineage: the maximal checkpoint and its immediate predecessor.  Every
+ * checkpoint below the predecessor is strictly dominated by a larger survivor
+ * and is worthless — delete it.  Also collapse exact duplicates.
+ *
+ * A checkpoint A is dominated by B iff A's stored token list is a strict
+ * prefix of B's and they are model/quant/ctx compatible.  Only the chain
+ * maxes' token lists are held in memory (bounded by the number of lineages,
+ * i.e. active conversations), so memory stays small regardless of cache size. */
+void ds4_kvstore_sweep(ds4_kvstore *kc) {
+    if (!kc->enabled || kc->len <= 1) return;
+    const uint64_t now = (uint64_t)time(NULL);
+    if (now < kc->last_sweep_ts +
+            (uint64_t)KV_CACHE_SWEEP_MIN_INTERVAL_SECONDS)
+        return;
+    kc->last_sweep_ts = now;
+
+    kv_sweep_item *it = kv_xmalloc((size_t)kc->len * sizeof(kv_sweep_item));
+    for (int i = 0; i < kc->len; i++) {
+        it[i].idx = i;
+        it[i].model_id = kc->entry[i].model_id;
+        it[i].quant_bits = kc->entry[i].quant_bits;
+        it[i].ctx_size = kc->entry[i].ctx_size;
+        it[i].tokens = kc->entry[i].tokens;
+    }
+    qsort(it, (size_t)kc->len, sizeof(kv_sweep_item), kv_sweep_item_cmp);
+
+    kv_chain *chains = kv_xmalloc((size_t)kc->len * sizeof(kv_chain));
+    int nchains = 0;
+    int *del = kv_xmalloc((size_t)kc->len * sizeof(int));
+    int ndel = 0;
+
+    int run_start = 0;
+    while (run_start < kc->len) {
+        int run_end = run_start + 1;
+        while (run_end < kc->len &&
+               it[run_end].model_id == it[run_start].model_id &&
+               it[run_end].quant_bits == it[run_start].quant_bits &&
+               it[run_end].ctx_size == it[run_start].ctx_size)
+            run_end++;
+        nchains = 0;
+        for (int k = run_start; k < run_end; k++) {
+            const int idx = it[k].idx;
+            ds4_kvstore_entry *e = &kc->entry[idx];
+            ds4_tokens tok = {0};
+            if (!ds4_kvstore_read_entry_tokens(e->path, &tok)) {
+                /* Unreadable payload: skip, never delete an unreadable entry. */
+                continue;
+            }
+            int c = -1;   /* chain whose max contains tok (largest such max) */
+            int dup = -1; /* chain whose max equals tok */
+            for (int j = 0; j < nchains; j++) {
+                const ds4_tokens *m = &chains[j].max_tok;
+                if (m->len == tok.len &&
+                    (tok.len == 0 ||
+                     memcmp(m->v, tok.v, (size_t)tok.len * sizeof(int)) == 0))
+                    dup = j;
+                if (m->len > tok.len && ds4_tokens_starts_with(m, &tok)) {
+                    if (c == -1 || m->len > chains[c].max_tok.len) c = j;
+                }
+            }
+            if (dup >= 0) {
+                /* Exact duplicate of an already-kept chain max: collapse it. */
+                del[ndel++] = idx;
+                ds4_tokens_free(&tok);
+                continue;
+            }
+            if (c < 0) {
+                /* No larger checkpoint contains tok: it starts a new chain. */
+                chains[nchains].max_idx = idx;
+                chains[nchains].pred_idx = -1;
+                ds4_tokens_copy(&chains[nchains].max_tok, &tok);
+                nchains++;
+                ds4_tokens_free(&tok);
+            } else if (chains[c].pred_idx >= 0) {
+                /* Already have the predecessor: anything smaller is dominated. */
+                del[ndel++] = idx;
+                ds4_tokens_free(&tok);
+            } else {
+                /* First chain member below the max: keep as predecessor. */
+                chains[c].pred_idx = idx;
+                ds4_tokens_free(&tok);
+            }
+        }
+        for (int j = 0; j < nchains; j++) ds4_tokens_free(&chains[j].max_tok);
+        run_start = run_end;
+    }
+
+    /* Delete dominated entries (descending index to keep removals valid). */
+    for (int i = 0; i < ndel; i++)
+        for (int j = i + 1; j < ndel; j++)
+            if (del[j] > del[i]) { int t = del[i]; del[i] = del[j]; del[j] = t; }
+    for (int d = 0; d < ndel; d++) {
+        const int idx = del[d];
+        if (idx < 0 || idx >= kc->len) continue;
+        ds4_kvstore_entry e = kc->entry[idx];
+        if (e.path && unlink(e.path) == 0) {
+            kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                    "%s: kv cache swept dominated checkpoint tokens=%u size=%.2f MiB file=%s",
+                    kv_log_name(kc), e.tokens,
+                    (double)e.file_size / (1024.0 * 1024.0),
+                    e.path ? e.path : "?");
+        }
+        ds4_kvstore_entry_free(&e);
+        memmove(kc->entry + idx, kc->entry + idx + 1,
+                (size_t)(kc->len - idx - 1) * sizeof(kc->entry[0]));
+        kc->len--;
+    }
+    free(del);
+    free(chains);
+    free(it);
+}
+
 int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                               ds4_engine *engine,
                               ds4_session *session,
                               const char *prompt_text,
+                              const ds4_tokens *prompt_tokens,
                               ds4_tokens *effective_prompt,
                               ds4_kvstore_load_result *result,
                               const ds4_kvstore_trailer_hooks *hooks,
@@ -1233,8 +1530,22 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
     if (!ds4_kvstore_quant_bits_supported(quant_bits)) return 0;
     const int model_id = ds4_engine_model_id(engine);
     const size_t prompt_bytes = strlen(prompt_text);
+    const int ctx_size = ds4_session_ctx(session);
     int idx = ds4_kvstore_find_text_prefix(kc, prompt_text, model_id, quant_bits,
-                                           ds4_session_ctx(session));
+                                           ctx_size);
+    bool token_match = false;
+    if (prompt_tokens && prompt_tokens->len > 0) {
+        /* The byte-prefix winner can sit far below the best possible reuse:
+         * on resume after an interruption the client re-serializes the recent
+         * turns with different bytes even though the KV token state still
+         * agrees.  Re-select by exact token prefix, keeping any byte-prefix
+         * winner as the floor so we never downgrade. */
+        const int min_tokens = idx >= 0 ? (int)kc->entry[idx].tokens : 0;
+        int t_idx = ds4_kvstore_find_token_prefix(kc, prompt_tokens, model_id,
+                                                  quant_bits, ctx_size,
+                                                  min_tokens);
+        if (t_idx >= 0) { idx = t_idx; token_match = true; }
+    }
     if (idx < 0) return 0;
 
     ds4_kvstore_entry e = kc->entry[idx];
@@ -1254,6 +1565,11 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
         if (hdr.model_id != (uint8_t)model_id) {
             header_ok = false;
             fail_reason = "cached checkpoint was written for a different model";
+        } else if (token_match) {
+            /* Selected by exact token prefix; the stored rendered bytes may
+             * legitimately differ from the prompt (the client re-serialized
+             * recent turns on resume).  The token prefix is re-verified after
+             * the payload is loaded below. */
         } else if ((uint64_t)text_bytes > prompt_bytes) {
             header_ok = false;
             fail_reason = "cached text is longer than prompt";
@@ -1277,22 +1593,43 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
             }
         }
     }
+    if (token_match && header_ok) {
+        /* The byte path advances the stream by reading the cached text; the
+         * token path skipped that read, so reposition at the payload start. */
+        if (fseek(fp, (long)(DS4_KVSTORE_FIXED_HEADER + 4ull + text_bytes),
+                  SEEK_SET) != 0) {
+            header_ok = false;
+            fail_reason = "failed to seek to checkpoint payload";
+        }
+    }
     char err[160] = {0};
     int loaded = 0;
     if (header_ok &&
         ds4_session_load_payload(session, fp, hdr.payload_bytes, err, sizeof(err)) == 0)
     {
         const ds4_tokens *loaded_tokens = ds4_session_tokens(session);
-        if (loaded_tokens && loaded_tokens->len == (int)hdr.tokens) {
+        const bool tokens_ok = loaded_tokens &&
+                               loaded_tokens->len == (int)hdr.tokens &&
+                               (!token_match ||
+                                ds4_tokens_starts_with(prompt_tokens, loaded_tokens));
+        if (tokens_ok) {
             loaded = (int)hdr.tokens;
             if (effective_prompt) {
-                /* The cache lookup was by bytes, but the graph state is still
-                 * the exact token history stored in the payload.  Build the
-                 * prompt from that exact history and tokenize only the text
-                 * suffix after the byte prefix. */
-                ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
-                    engine, loaded_tokens, prompt_text + text_bytes,
-                    effective_prompt);
+                if (token_match) {
+                    /* The loaded token history is an exact token-prefix of the
+                     * prompt (verified above), so the full re-tokenized prompt
+                     * is the correct effective prompt — the boundary is clean
+                     * by construction, unlike the byte-prefix path. */
+                    ds4_tokens_copy(effective_prompt, prompt_tokens);
+                } else {
+                    /* The cache lookup was by bytes, but the graph state is
+                     * still the exact token history stored in the payload.
+                     * Build the prompt from that exact history and tokenize
+                     * only the text suffix after the byte prefix. */
+                    ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
+                        engine, loaded_tokens, prompt_text + text_bytes,
+                        effective_prompt);
+                }
             }
             if (hooks && hooks->load && (hdr.ext_flags & hooks->ext_flag)) {
                 hooks->load(hooks->ud, fp, hooks->load_wanted);
@@ -1326,10 +1663,11 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
         const char *key_kind = ds4_kvstore_key_kind(hdr.ext_flags);
         ds4_kvstore_touch_file(path, hdr.hits + 1);
         kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-                "%s: kv cache hit text%s%s tokens=%d text=%u quant=%u key=%s load=%.1f ms file=%s",
+                "%s: kv cache hit text%s%s%s tokens=%d text=%u quant=%u key=%s load=%.1f ms file=%s",
                 kv_log_name(kc),
                 responses_protocol ? " " : "",
                 responses_protocol ? "RESPPROTO" : "",
+                token_match ? " TOKENPREFIX" : "",
                 loaded, text_bytes, hdr.quant_bits, key_kind, load_ms, path);
         if (result) {
             result->tokens = loaded;

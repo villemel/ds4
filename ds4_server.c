@@ -11423,6 +11423,7 @@ static int kv_cache_find_text_prefix(kv_disk_cache *kc, const char *prompt_text,
 
 static int kv_cache_try_load_text(server *s, server_slot *slot,
                                   const char *prompt_text,
+                                  const ds4_tokens *prompt_tokens,
                                   ds4_tokens *effective_prompt,
                                   char **loaded_path_out,
                                   uint8_t *loaded_ext_flags_out,
@@ -11441,7 +11442,8 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
     }
     pthread_mutex_lock(&s->kv_mu);
     int loaded = ds4_kvstore_try_load_text(&s->kv, s->engine, slot->session,
-                                           prompt_text, effective_prompt, &lr,
+                                           prompt_text, prompt_tokens,
+                                           effective_prompt, &lr,
                                            &hooks, responses_protocol);
     pthread_mutex_unlock(&s->kv_mu);
     pthread_mutex_unlock(&s->inference_mu);
@@ -11457,7 +11459,9 @@ static int kv_cache_try_load(server *s, server_slot *slot, const request *req,
                              ds4_tokens *effective_prompt,
                              char **loaded_path_out,
                              uint8_t *loaded_ext_flags_out) {
-    return kv_cache_try_load_text(s, slot, req ? req->prompt_text : NULL,
+    return kv_cache_try_load_text(s, slot,
+                                  req ? req->prompt_text : NULL,
+                                  (req && req->prompt_text) ? &req->prompt : NULL,
                                   effective_prompt,
                                   loaded_path_out,
                                   loaded_ext_flags_out,
@@ -13038,6 +13042,7 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
         ds4_tokens effective = {0};
         int loaded = kv_cache_try_load_text(s, slot,
                                             rendered.ptr ? rendered.ptr : "",
+                                            &canonical,
                                             &effective, &path, NULL, false);
         if (loaded == 0) {
             pthread_mutex_lock(&s->inference_mu);
@@ -21687,6 +21692,46 @@ static void test_kv_text_stub_file(const char *dir, const char *text,
     test_kv_text_stub_file_model(dir, text, 0, reason, tokens, payload_bytes);
 }
 
+/* Write a kv file whose payload begins with a real ds4_session token list
+ * (fixed u32 header + token ids), so the token-prefix matcher can read it. */
+static void test_kv_payload_stub_file(const char *dir, const char *text,
+                                      uint8_t model_id, uint8_t reason,
+                                      uint32_t tokens, const uint32_t *ids) {
+    char sha[41];
+    sha1_bytes_hex(text, strlen(text), sha);
+    char name[44];
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    char *path = path_join(dir, name);
+    FILE *fp = fopen(path, "wb");
+    TEST_ASSERT(fp != NULL);
+    if (!fp) { free(path); return; }
+
+    const uint64_t payload_bytes =
+        (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t) +
+        (uint64_t)tokens * sizeof(uint32_t);
+
+    uint8_t h[KV_CACHE_FIXED_HEADER];
+    ds4_kvstore_fill_header(h, model_id, 2, reason, 0, tokens, 0,
+                            32768, 100, 100, payload_bytes);
+    uint8_t text_len[4];
+    le_put32(text_len, (uint32_t)strlen(text));
+    TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
+    TEST_ASSERT(fwrite(text_len, 1, sizeof(text_len), fp) == sizeof(text_len));
+    TEST_ASSERT(fwrite(text, 1, strlen(text), fp) == strlen(text));
+
+    uint32_t ph[DS4_SESSION_PAYLOAD_U32_FIELDS];
+    memset(ph, 0, sizeof(ph));
+    ph[0] = DS4_SESSION_PAYLOAD_MAGIC;
+    ph[1] = DS4_SESSION_PAYLOAD_VERSION;
+    ph[7] = tokens;
+    TEST_ASSERT(fwrite(ph, sizeof(uint32_t), DS4_SESSION_PAYLOAD_U32_FIELDS, fp) ==
+                DS4_SESSION_PAYLOAD_U32_FIELDS);
+    for (uint32_t i = 0; i < tokens; i++)
+        TEST_ASSERT(fwrite(&ids[i], sizeof(uint32_t), 1, fp) == 1);
+    TEST_ASSERT(fclose(fp) == 0);
+    free(path);
+}
+
 static void test_kv_cache_lookup_uses_longest_text_prefix(void) {
     char tmpl[] = "/tmp/ds4-kv-text-prefix-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -21797,6 +21842,63 @@ static void test_kv_cache_lookup_rejects_stale_payload_abi(void) {
     kv_cache_close(&kc);
     unlink(path);
     free(path);
+    rmdir(dir);
+}
+
+static void test_kv_cache_token_prefix_finds_largest_match(void) {
+    char tmpl[] = "/tmp/ds4-kv-token-prefix-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    /* A small waypoint and a large tip on the same conversation.  The prompt
+     * tokenizes to a superset of both; the rendered texts are unrelated, so a
+     * pure byte-prefix matcher would stop at the small waypoint (the resume
+     * divergence bug).  The token-prefix matcher must pick the large tip. */
+    uint32_t small_ids[4] = {100, 200, 300, 400};
+    uint32_t large_ids[8] = {100, 200, 300, 400, 500, 600, 700, 800};
+    test_kv_payload_stub_file(dir, "small waypoint rendered text", 0,
+                              KV_REASON_COLD, 4, small_ids);
+    test_kv_payload_stub_file(dir, "large tip rendered text", 0,
+                              KV_REASON_EVICT, 8, large_ids);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+
+    ds4_tokens prompt = {0};
+    const int expect[12] = {100,200,300,400,500,600,700,800,900,1000,1100,1200};
+    for (int i = 0; i < 12; i++) ds4_tokens_push(&prompt, expect[i]);
+
+    int idx = ds4_kvstore_find_token_prefix(&kc, &prompt, 0, 2, 32768, 0);
+    TEST_ASSERT(idx >= 0);
+    TEST_ASSERT(idx >= 0 && kc.entry[idx].tokens == 8);
+
+    /* Raising the floor to the tip size must not return anything smaller. */
+    TEST_ASSERT(ds4_kvstore_find_token_prefix(&kc, &prompt, 0, 2, 32768, 8) < 0);
+
+    /* A prompt that is not a superset must not match. */
+    ds4_tokens other = {0};
+    ds4_tokens_push(&other, 999);
+    TEST_ASSERT(ds4_kvstore_find_token_prefix(&kc, &other, 0, 2, 32768, 0) < 0);
+    ds4_tokens_free(&other);
+
+    ds4_tokens_free(&prompt);
+    kv_cache_close(&kc);
+
+    char sha1[41], sha2[41];
+    sha1_bytes_hex("small waypoint rendered text",
+                   strlen("small waypoint rendered text"), sha1);
+    sha1_bytes_hex("large tip rendered text",
+                   strlen("large tip rendered text"), sha2);
+    char name1[44], name2[44];
+    snprintf(name1, sizeof(name1), "%.40s.kv", sha1);
+    snprintf(name2, sizeof(name2), "%.40s.kv", sha2);
+    char *p1 = path_join(dir, name1);
+    char *p2 = path_join(dir, name2);
+    unlink(p1); unlink(p2);
+    free(p1); free(p2);
     rmdir(dir);
 }
 
@@ -23078,6 +23180,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_lookup_uses_longest_text_prefix();
     test_kv_cache_lookup_rejects_wrong_model();
     test_kv_cache_lookup_rejects_stale_payload_abi();
+    test_kv_cache_token_prefix_finds_largest_match();
     test_kv_cache_eviction_values_fresh_snapshots();
     test_kv_cache_eviction_prefers_anchor_reason();
     test_kv_cache_eviction_makes_room_before_store();

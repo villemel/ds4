@@ -840,6 +840,14 @@ tests/test_layer_pack.o: tests/test_layer_pack.c ds4_layer_pack.h
 tests/test_layer_pack: tests/test_layer_pack.o ds4_layer_pack.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
+tests/test_kvstore_sweep.o: tests/test_kvstore_sweep.c ds4_kvstore.h ds4.h
+	$(CC) $(CFLAGS) -I. -ffunction-sections -fdata-sections -c -o $@ $<
+
+tests/test_kvstore_sweep: tests/test_kvstore_sweep.o ds4_kvstore.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS) -Wl,-dead_strip
+
+test-kvstore-sweep: tests/test_kvstore_sweep
+
 tests/test_gpu_args.o: tests/test_gpu_args.c ds4_gpu_args.h ds4_gpu_mgpu.h
 	$(CC) $(CFLAGS) -I. -DDS4_NO_GPU -c -o $@ $<
 

@@ -91,6 +91,12 @@ static void *kv_xmalloc(size_t n) {
     return p;
 }
 
+static void *kv_xcalloc(size_t n) {
+    void *p = calloc(n ? n : 1, 1);
+    if (!p) kv_die("out of memory");
+    return p;
+}
+
 static void *kv_xrealloc(void *p, size_t n) {
     p = realloc(p, n ? n : 1);
     if (!p) kv_die("out of memory");
@@ -1428,9 +1434,9 @@ void ds4_kvstore_sweep(ds4_kvstore *kc) {
     }
     qsort(it, (size_t)kc->len, sizeof(kv_sweep_item), kv_sweep_item_cmp);
 
-    kv_chain *chains = kv_xmalloc((size_t)kc->len * sizeof(kv_chain));
+    kv_chain *chains = kv_xcalloc((size_t)kc->len * sizeof(kv_chain));
     int nchains = 0;
-    int *del = kv_xmalloc((size_t)kc->len * sizeof(int));
+    int *del = kv_xcalloc((size_t)kc->len * sizeof(int));
     int ndel = 0;
 
     int run_start = 0;

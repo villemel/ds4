@@ -85,3 +85,10 @@ tests/ds4_server_sc_failure
 tests/test_dflash_windowed
 tests/test_dflash_selector_confidence
 tests/test_dflash_sdpa
+
+# agent-session artifacts
+*.bak
+*.log
+/.pi/
+/.ds4flash_default_backup
+/tests/test_prompt_prefix

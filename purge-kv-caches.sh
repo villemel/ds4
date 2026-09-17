@@ -27,8 +27,7 @@ ENVELOPE_MB=1572864   # 1.5 TiB
 
 # hours  kv-dir                                    where that instance declares its budget
 TABLE="
-72 $HOME/.ds4/server-kv      $HOME/Library/LaunchAgents/com.ds4-glm53-flash.server.plist
-48 $HOME/.ds4-v4/server-kv   $HOME/ds4-v4/run-server.sh
+72 $HOME/.ds4/server-kv      $HOME/ds4/run-server.sh
 48 $HOME/.ds4-v41/server-kv  $HOME/ds4-v41/run-server.sh
 48 $HOME/.ds4-qfn/server-kv  $HOME/ds4-qfn/run-server.sh
 "

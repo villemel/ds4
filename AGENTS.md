@@ -1,6 +1,6 @@
 # Agent Notes
 
-`ds4.c` is a DeepSeek V4 Flash specific inference engine. It is not a generic
+`ds4.c` is an inference engine. It is not a generic
 GGUF runner. The goal is a small, readable, high-performance C codebase with
 Objective-C only where Metal requires it and Metal kernels under `metal/`.
 
@@ -36,7 +36,14 @@ Objective-C only where Metal requires it and Metal kernels under `metal/`.
 - `ds4_server.c`: OpenAI/Anthropic compatible HTTP API, worker queue, streaming,
   tool-call mapping, disk KV cache policy.
 - `ds4_metal.m`: Objective-C Metal runtime and kernel wrappers.
-- `metal/*.metal`: compute kernels.
+- `ds4_ssd.c`: SSD streaming of routed experts. `ds4_distributed.c` /
+  `ds4_tp.c`: pipeline parallelism / tensor parallelism. `ds4_layer_pack.c`:
+  layer packing.
+- `ds4_server.c` pulls in `ds4_kvstore.c` (KV disk cache) and `rax.c`
+  (radix tree). `ds4_agent.c` + `ds4_web.c`: the coding agent.
+- `ds4_bench.c`: speed/throughput regression runner. `ds4_eval.c`: eval/self-test.
+- `metal/*.metal`: Metal kernels. `cuda/` and `rocm/`: CUDA (incl. vendored
+  `cuda/mmq/`) and ROCm kernels. `gguf-tools/`: offline GGUF/imatrix/quality.
 - `tests/`: unit and live integration tests.
 - `misc/`: ignored notes, experiments, and old planning material.
 
@@ -44,9 +51,24 @@ This list is not complete, check the files for more info.
 
 ## Testing
 
-Use `make` for build validation. Use `make test` for unit/regression tests when a
-model and Metal are available. Use live server tests only when intentionally
-testing the API surface.
+`make` builds `./ds4`, `./ds4-server`, `./ds4-bench`, `./ds4-eval`, `./ds4-agent`.
+
+`make test` builds and runs the full regression suite (`ds4_test`, `ds4_agent_test`,
+`ds4-eval --self-test-extractors`, q4k/mxfp4 dot tests, layer pack, mgpu placement,
+gpu args, sampling). It needs a model and Metal. Narrower checks:
+
+```sh
+./ds4_test --server            # API / prompt-rendering / KV-cache logic
+./ds4_test --logprob-vectors   # tokenizer/template/attention/logits vs official vecs
+./ds4_test --long-context      # long-context story fact-recall
+./ds4_test --tool-call-quality # DSML tool-call emission
+./ds4_test --metal-kernels     # isolated Metal kernel numeric checks
+```
+
+Speed regressions use `./ds4-bench` (see CONTRIBUTING.md for exact flags).
+CUDA-specific changes: `make cuda-regression` on a CUDA machine.
+DSpark/MTP smoke: `make dspark-verify-depth` / `make mtp-verify-depth` (they
+skip if the model or support GGUF is absent).
 
 At every major change where one of the following could be affected, make sure to:
 
@@ -54,3 +76,20 @@ At every major change where one of the following could be affected, make sure to
 2. Test the SSD streaming path.
 3. Test the distributed inference if it could be affected, but ask the user before doing so.
 4. Check if CUDA could be broken after the change, and ask the user to give you access to the CUDA machine to actually test if everything is still fine.
+
+## Pitfalls
+
+- Do not hand-edit generated artifacts: `cuda/mmq/` is vendored llama.cpp
+  (see `cuda/mmq/VENDOR.md`), and `ds4_iq2_tables_cuda.inc` / the MXFP4 half LUT
+  are generated (verify the LUT with `make check-mxfp4-half-lut`).
+- Model GGUFs are engine-specific (DeepSeek V4 Flash/PRO, GLM 5.2 only). An
+  arbitrary GGUF will not load — not a general GGUF runner.
+- Distributed/tensor-parallel runs split layers via `--layers` and the
+  coordinator/worker roles; layer ranges are inclusive (`10:20`,
+  `31:output`).
+- Exercise caution when emitting raw thinking tags or other parseable units or 
+  pairs in output as they are consumed by agent clients and interrupt loops. 
+  Disguise, encode or otherwise render them illegible to clients: backticks, 
+  grave accents, backquotes, Unicode Code Point U+0060, HTML Entities: &grave, 
+  or &#96, with a zero-width space between them. This mitigates the major risk of 
+  corrupted KV cache. You can also use: think_open, think_close, etc.

@@ -3203,6 +3203,21 @@ static bool chat_history_uses_tool_context(const chat_msgs *msgs,
     return false;
 }
 
+/* Clients that must echo reasoning_content back (DeepSeek thinking mode
+ * rejects an empty string) pad an empty thinking channel with a single space
+ * on replay.  The model itself always samples the closing tag immediately
+ * after the opening one, so a whitespace-only channel re-renders to nothing:
+ * <think> + " " + </think> re-tokenizes to an extra
+ * space token that the live KV does not have, and that one token
+ * invalidates the whole prefix.  Render it as the clean <think></think>
+ * boundary the KV was sampled from. */
+static const char *thinking_reasoning_visible(const char *reasoning) {
+    if (!reasoning) return "";
+    const char *p = reasoning;
+    while (*p && isspace((unsigned char)*p)) p++;
+    return *p ? reasoning : "";
+}
+
 static char *render_deepseek_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
                                               const tool_schema_orders *tool_orders,
                                               ds4_think_mode think_mode) {
@@ -3257,7 +3272,7 @@ static char *render_deepseek_chat_prompt_text(const chat_msgs *msgs, const char 
                 if (think) {
                     if (tool_context || i > last_user_idx) {
                         buf_puts(&out, "<think>");
-                        buf_puts(&out, m->reasoning ? m->reasoning : "");
+                        buf_puts(&out, thinking_reasoning_visible(m->reasoning));
                         buf_puts(&out, "</think>");
                     } else {
                         buf_puts(&out, "</think>");
@@ -3302,7 +3317,7 @@ static void append_glm_assistant_message_prefix(buf *out,
     if (text_starts_with_think_tag(content)) return;
     if (preserve_reasoning) {
         buf_puts(out, "<think>");
-        buf_puts(out, m && m->reasoning ? m->reasoning : "");
+        buf_puts(out, thinking_reasoning_visible(m ? m->reasoning : NULL));
         buf_puts(out, "</think>");
     } else {
         buf_puts(out, "<think></think>");
@@ -3528,7 +3543,7 @@ static char *render_deepseek_live_tool_tail(const chat_msgs *msgs, int start,
                 buf_puts(&out, "<｜Assistant｜>");
                 if (think) {
                     buf_puts(&out, "<think>");
-                    buf_puts(&out, m->reasoning ? m->reasoning : "");
+                    buf_puts(&out, thinking_reasoning_visible(m->reasoning));
                     buf_puts(&out, "</think>");
                 } else {
                     buf_puts(&out, "</think>");
@@ -19841,6 +19856,34 @@ static void test_thinking_state_tracks_prompt_and_generated_tags(void) {
     request_free(&r);
 }
 
+static void test_thinking_whitespace_renders_empty(void) {
+    TEST_ASSERT(!strcmp(thinking_reasoning_visible(NULL), ""));
+    TEST_ASSERT(!strcmp(thinking_reasoning_visible(" "), ""));
+    TEST_ASSERT(!strcmp(thinking_reasoning_visible("\n\t"), ""));
+    TEST_ASSERT(!strcmp(thinking_reasoning_visible("need a tool"), "need a tool"));
+
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("continue");
+    chat_msgs_push(&msgs, user);
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    assistant.reasoning = xstrdup(" ");
+    assistant.content = xstrdup("");
+    chat_msgs_push(&msgs, assistant);
+
+    char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
+    /* The padded space must not survive into the rendered tags: the
+     * boundary is the clean opening tag immediately followed by the
+     * closing one, exactly as the live KV was sampled. */
+    TEST_ASSERT(strstr(prompt, "<think></think>") != NULL);
+    TEST_ASSERT(strstr(prompt, "<think> </think>") == NULL);
+
+    free(prompt);
+    chat_msgs_free(&msgs);
+}
+
 static void test_thinking_checkpoint_remember_gate(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -21517,6 +21560,7 @@ static void ds4_server_unit_tests_run(void) {
     test_cancel_running_job_keeps_worker_ownership();
     test_cancel_withdraws_only_pending_decode();
     test_thinking_state_tracks_prompt_and_generated_tags();
+    test_thinking_whitespace_renders_empty();
     test_thinking_checkpoint_remember_gate();
     test_thinking_checkpoint_key_matches_tool_replay();
     test_thinking_checkpoint_key_matches_reasoning_free_replay();

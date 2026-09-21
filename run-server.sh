@@ -14,6 +14,11 @@
 # its own directory so Qwen checkpoints (which include recurrent state) can
 # never be selected by another server's cache.
 #
+# Logs: ~/Library/Logs/ds4-server-qfn/{out,err}.log, rotated fleet-wide by
+# ~/ds4/rotate-logs.sh (launchd com.ds4.log-rotation, daily 03:00, 7 day
+# retention, copytruncate so no restart). That script lists every ds4 model's
+# log dir; a new worktree needs one LOG_DIRS line there.
+#
 # Usage: ./run-server.sh [start|stop|status]   (default: start)
 
 set -eu

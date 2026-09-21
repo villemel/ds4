@@ -16,6 +16,10 @@
 # purge-kv-caches.sh envelope accounting, which reads it from this file while
 # the legacy ~/.ds4/server-kv store drains through the 72h purge.
 #
+# Logs: the plist redirects to ~/Library/Logs/ds4-glm-5.3-server/{out,err}.log,
+# rotated fleet-wide by ~/ds4/rotate-logs.sh (launchd com.ds4.log-rotation,
+# daily 03:00, 7 day retention, copytruncate so no restart is needed).
+#
 # Usage: ./run-server.sh [start|stop|restart|status]
 set -eu
 LABEL=com.ds4-glm5.3-flash.server

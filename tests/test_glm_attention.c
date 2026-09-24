@@ -43,9 +43,11 @@ static ds4_gpu_tensor *upload_cache(const float *data, size_t count, bool f16) {
     return t;
 }
 
-static void attention_reference(float *out, const float *low, const float *kv,
+static void attention_reference(float *out, const float *q, const float *low,
+        const float *kv, const float *kr,
         const int32_t *ids, uint32_t tokens, uint32_t heads, uint32_t dim,
-        uint32_t pos, uint32_t cap, uint32_t count, uint32_t nope, bool selected) {
+        uint32_t pos, uint32_t cap, uint32_t count, uint32_t nope,
+        uint32_t rope, bool selected) {
     double *weights = calloc(count, sizeof(*weights));
     check(weights != NULL, "reference allocation");
     for (uint32_t t = 0; t < tokens; t++) {
@@ -61,7 +63,15 @@ static void attention_reference(float *out, const float *low, const float *kv,
                 if (row >= cap) continue;
                 for (uint32_t d = 0; d < dim; d++)
                     dot += (double)low[base + d] * kv[(size_t)row * dim + d];
-                sum += weights[i] = exp(dot / sqrt(nope));
+                for (uint32_t d = 0; d < rope; d += 2) {
+                    const double theta = row * pow(10000.0, -(double)d / rope);
+                    const double x = kr[(size_t)row * rope + d];
+                    const double y = kr[(size_t)row * rope + d + 1];
+                    const size_t qi = ((size_t)t * heads + h) * (nope + rope) + nope + d;
+                    dot += q[qi] * (x * cos(theta) - y * sin(theta)) +
+                           q[qi + 1] * (x * sin(theta) + y * cos(theta));
+                }
+                sum += weights[i] = exp(dot / sqrt(nope + rope));
             }
             for (uint32_t d = 0; d < dim; d++) {
                 double value = 0;
@@ -153,7 +163,7 @@ static void pooled_tail_case(uint32_t tail_valid, bool full_end_over_prefix) {
 static void attention_case(uint32_t tokens, uint32_t heads, uint32_t dim,
                            uint32_t pos, uint32_t cap, bool selected,
                            bool zero_rope, bool bench, bool f16) {
-    const uint32_t nope = zero_rope ? 256 : 32, rope = zero_rope ? 0 : 8;
+    const uint32_t nope = zero_rope ? 256 : 32, rope = zero_rope ? 0 : 64;
     const uint32_t count = selected ? (cap > 2048 ? 2051 : 8) : cap;
     const bool known_answer = selected && !f16;
     const size_t out_n = (size_t)tokens * heads * dim;
@@ -196,11 +206,11 @@ static void attention_case(uint32_t tokens, uint32_t heads, uint32_t dim,
     ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(out_n * sizeof(float));
     check(out != NULL, "output allocation");
     float *oracle = NULL;
-    if (zero_rope && !bench) {
+    if (!bench) {
         oracle = malloc(out_n * sizeof(float));
         check(oracle != NULL, "attention oracle allocation");
-        attention_reference(oracle, low, kv, ids, tokens, heads, dim,
-                            pos, cap, count, nope, selected);
+        attention_reference(oracle, q, low, kv, kr, ids, tokens, heads, dim,
+                            pos, cap, count, nope, rope, selected);
     }
     const char *flag = selected ? "DS4_ROCM_GLM_SELECTED_ATTN_GEMM" :
                                   "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM";
@@ -405,6 +415,63 @@ static void pooled_decode_case(uint32_t tail_valid, int mode) {
     printf("pooled decode mode=%d tail_valid=%u: PASS\n", mode, tail_valid);
 }
 #endif
+static void pooled_decode_cases(void) {
+#ifdef __APPLE__
+    enum { D = 512, H = 8, V = 4, R = 64, C = 2056, S = 2051, B = 17,
+           MODEL_BYTES = 65536 };
+    unsigned char *model = mmap(NULL, MODEL_BYTES, PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANON, -1, 0);
+    check(model != MAP_FAILED, "pooled model allocation");
+    for (int i = 0; i < H * V * (D / 32); i++) {
+        _Float16 scale = 1;
+        memcpy(model + i * 34, &scale, sizeof(scale));
+        memset(model + i * 34 + 2, 1, 32);
+    }
+    check(ds4_gpu_set_model_map(model, MODEL_BYTES), "pooled model registration");
+    float *kv = malloc(C * D * sizeof(float));
+    float *kr = calloc(C * R, sizeof(float));
+    float low[H * D], q[H * (32 + R)] = {0}, ref[H * D], actual[H * V];
+    int32_t ids[S];
+    check(kv && kr, "pooled host allocation");
+    for (int i = 0; i < C * D; i++) kv[i] = (i % 31 - 15) * 0.03125f;
+    for (int i = 0; i < H * D; i++) low[i] = (i % 23 - 11) * 0.015625f;
+    ds4_gpu_tensor *kg = upload_cache(kv, C * D, true);
+    ds4_gpu_tensor *rg = upload_cache(kr, C * R, true);
+    ds4_gpu_tensor *lg = upload(low, sizeof(low)), *qg = upload(q, sizeof(q));
+    ds4_gpu_tensor *ig = ds4_gpu_tensor_alloc(sizeof(ids));
+    ds4_gpu_tensor *pl = ds4_gpu_tensor_alloc(B * H * D * sizeof(float));
+    ds4_gpu_tensor *pm = ds4_gpu_tensor_alloc(B * H * 2 * sizeof(float));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(sizeof(actual));
+    check(ig && pl && pm && out, "pooled workspace allocation");
+    for (int tail = 0; tail <= 3; tail++) {
+        for (int i = 0; i < S; i++) ids[i] = i < 2048 + tail ? i : -1;
+        attention_reference(ref, q, low, kv, kr, ids, 1, H, D, C - 1,
+                            C, S, 32, R, true);
+        check(ds4_gpu_tensor_write(ig, 0, ids, sizeof(ids)), "pooled ids");
+        for (int run = 0; run < 3; run++) {
+            check(ds4_gpu_glm_attention_indexed_decode_split_group8_tensor(
+                  out, pl, pm, qg, lg, kg, rg, model, MODEL_BYTES, 0,
+                  ig, S, false, C, true, H, D, 32, R, V, 4096,
+                  128, B, 10000, 1, 0, 1, 32, 1), "pooled split attention");
+            check(ds4_gpu_tensor_read(out, 0, actual, sizeof(actual)), "pooled read");
+            for (int h = 0; h < H; h++) {
+                double expected = 0;
+                for (int d = 0; d < D; d++) expected += ref[h * D + d];
+                for (int v = 0; v < V; v++)
+                    check(isfinite(actual[h * V + v]) &&
+                          fabs(actual[h * V + v] - expected) < 0.002,
+                          "pooled tail attention reference");
+            }
+        }
+    }
+    ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(pm); ds4_gpu_tensor_free(pl);
+    ds4_gpu_tensor_free(ig); ds4_gpu_tensor_free(qg); ds4_gpu_tensor_free(lg);
+    ds4_gpu_tensor_free(rg); ds4_gpu_tensor_free(kg);
+    ds4_gpu_cleanup();
+    free(kr); free(kv); munmap(model, MODEL_BYTES);
+    puts("pooled decode padding: PASS");
+#endif
+}
 
 static void reduction_cases(void) {
     enum { D = 512, N = 128, T = 3, C = 521, H = 8, V = 4, R = 64, MODEL_BYTES = 65536 };
@@ -506,6 +573,22 @@ static void reduction_cases(void) {
         for (int i = 0; i < C; i++) selected[i] = mode == 2 ? -1 :
             (mode == 1 && i % 2 == 0 ? (i % 4 == 0 ? -1 : C) : i);
         check(ds4_gpu_tensor_write(ig, 0, selected, sizeof(selected)), "split ids");
+        /* Every context-length remainder must satisfy Metal's 16-byte
+         * threadgroup allocation rule, in both cache formats. */
+        for (int f16 = 0; f16 < 2; f16++) {
+            ds4_gpu_tensor *cache = upload_cache(kv, C * D, f16);
+            for (int count = C - 3; count <= C; count++) {
+                check(ds4_gpu_glm_attention_indexed_decode_tensor(
+                      out, qg, lg, cache, rg, model, MODEL_BYTES, 4096,
+                      ig, count, C, f16, H, D, 32, 0, V, 4096,
+                      10000, 1, 0, 1, 32, 1), "indexed decode attention");
+                check(ds4_gpu_tensor_read(out, 0, split, sizeof(split)), "indexed decode read");
+                for (int i = 0; i < H * V; i++)
+                    check(isfinite(split[i]) && fabsf(split[i] - (mode == 2 ? 0 : D)) < 0.01f,
+                          "indexed decode reference");
+            }
+            ds4_gpu_tensor_free(cache);
+        }
         for (int run = 0; run < 20; run++) {
             check(ds4_gpu_glm_attention_indexed_decode_split_group8_tensor(
                   out, pl, pm, qg, lg, kg, rg, model, MODEL_BYTES, 4096,
@@ -571,7 +654,12 @@ int main(int argc, char **argv) {
         pooled_decode_case(0, 2);          /* arbitrary invalid ids, no claim */
         pooled_decode_case(3, 3);          /* no-pad control */
 #endif
+        for (int f16 = 0; f16 < 2; f16++) {
+            attention_case(32, 8, 512, 0, 32, false, false, false, f16);
+            attention_case(31, 17, 512, 97, 128, false, false, false, f16);
+        }
         reduction_cases();
+        pooled_decode_cases();
     }
     return 0;
 }

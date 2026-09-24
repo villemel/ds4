@@ -37,9 +37,13 @@ the main model can be resident or SSD-streamed. DSpark replaces the legacy
 one-stage MTP drafter for that run; the two are not stacked.
 
 Resident M5 paths batch supported verifier expert rows, including two-Mac TP.
+On DGX Spark, resident Q2 also batches the seed with longer drafts and uses
+small-batch Q8 and expert kernels. No extra flags are needed.
 The scheduler can back off when drafting is unproductive. Defaults select the
 fast paths; diagnostic environment variables are not needed for normal use.
 Recorded comparisons are in [the QA guide](../QA_BEFORE_RELEASES.md).
+
+For the tested Strix Halo coding configuration, use `--dspark --dspark-confidence 0.7` with the default five-token draft cap and scheduler. Client sampling is temperature `1.0`, `top_p=0.95`, `min_p=0`, and `top_k=0`; high reasoning was also checked on coding and tool-use requests. This uses opportunistic sampling as described below; exact-mode throughput is not qualified by these measurements. `--mtp-draft` controls legacy autoregressive MTP, not the DSpark draft width.
 
 ## GLM: built-in MTP
 
@@ -53,6 +57,26 @@ GLM's draft block is already in its main GGUF:
 The current GLM cycle commits up to two tokens. No external support file is
 needed, and ordinary decode remains the default.
 
+## Qwen3.8: built-in MTP
+
+Both Qwen downloads include MTP and native BF16 n-grams in the main GGUF:
+
+```sh
+./download_model.sh qwen38-q4k
+./ds4 --mtp
+```
+
+Ordinary decode uses the same file with `--mtp` omitted. For non-zero
+temperature, add `--mtp-exact-sampling` to preserve the target sampling
+distribution. See [Qwen setup](QWEN38_FLASH_NEXT.md) for Metal and CUDA.
+
+The cycle drafts one token ahead by default and engages a **second, chained
+draft** (one extra nextn-layer step conditioned on the predictor's own
+stream, verified in a 3-row pass) while recent first-draft acceptance is
+perfect, disengaging after repeated second-draft rejections.
+`DS4_QWEN4_MTP_DEPTH=2` or `=3` fixes the depth;
+`0` (default) is the adaptive policy.
+
 ## Sampling and reproducibility
 
 At temperature zero, accepted drafts must match the target's greedy
@@ -64,6 +88,13 @@ not match. This is deliberately more deterministic than ordinary sampling.
 Use `--mtp-exact-sampling` to preserve the ordinary target sampling
 distribution. Exact mode accepts greedy proposals with their target
 probability and samples from the remaining distribution on rejection.
+
+When a verified block crosses a tool sampling-mode boundary (for example
+entering tool-call syntax during server decoding), the server rewinds to the
+block start and re-evaluates the boundary token so the next sample uses the
+new mode. Under exact sampling that rewind restores a pre-verify snapshot of
+the recurrent state instead of resetting the graph, so long retained
+contexts are not replayed at every boundary.
 
 Accepted tokens keep the state produced by the batched verifier. Floating-point
 reduction order can differ from one-token decode, so long greedy continuations

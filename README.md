@@ -2,34 +2,37 @@
   <img src="logo.svg" alt="DwarfStar logo" width="220">
 </p>
 
-**DwarfStar** is a small native inference engine optimized first for
-**DeepSeek V4 Flash** (including the experimental vision model).
-It also supports **GLM 5.2 and 5.3**, **GLM 5.3 Flash**, and
-**DeepSeek V4 PRO**. It is self-contained and
-deliberately narrow, not a general GGUF runner. Model loading, prompt rendering,
+**DwarfStar** aims to be the best way to run a few excellent large
+language models on consumer hardware (that is, hardware that people
+can actually own). To reach this goal, we are building
+a small native inference engine optimized first for
+**DeepSeek V4 Flash** (including the experimental vision model),
+**DeepSeek V4.1 Flash** (Metal, and text inference on CUDA),
+and additionally **GLM 5.2 and 5.3**, **GLM 5.3 Flash** and
+**DeepSeek V4 PRO**, and **Qwen3.8 Flash Next** (Metal and CUDA). The code is self-contained and
+deliberately narrow, not a general GGUF runner: you need to use the
+GGUF files the project produces, that are part of the project
+itself.
+
+We test things in integration: model loading, prompt rendering,
 tool calls, KV state, the HTTP server, and the coding agent are built and tested together.
 The repository also includes tools and data for GGUF, imatrix, quality, and speed.
 
-Supported backends:
+## Supported hardware
 
 * **Metal**, the primary target, on Macs with 96 GB or more. Smaller machines
-  can use SSD streaming.
-* **NVIDIA CUDA**, including multi-GPU systems and DGX Spark.
+  can use SSD streaming. SSD streaming is also needed in order to run very
+  large models such as full GLM 5.x (not Flash) on 128GB systems.
+* **NVIDIA CUDA**, the DGX Spark is our main gaol. DwarfStar also supports multi-GPU systems that are not supported by other backends, for instance it can run DeepSeek v4 Flash on Ada Lovelace cards.
 * **ROCm** on Strix Halo systems such as the Framework Desktop.
 
 This project would not exist without **llama.cpp and GGML**, make sure to read
 the acknowledgements section, a big thank you to Georgi Gerganov and all the
 other contributors.
 
-Model support is intentionally opportunistic. The project follows the best open
-weights for useful local machine sizes, especially 128 GB laptops and 512 GB
+**Model support is intentionally opportunistic**. The project follows the best open
+weights for useful local machine sizes, especially 128 GB laptops and 256/512 GB
 workstations. A model may be removed when a better replacement arrives.
-
-The project has first class support for SSD streaming of weights, so it is
-possible to run models bigger than RAM while often still getting decent
-performances, and even running very large models (like the full GLM 5.3 or DeepSeek v4 PRO)
-on systems with just 128GB of RAM at a slower speed, but fast enough for
-QA-style chats.
 
 # So, what can I do with this software?
 
@@ -47,7 +50,7 @@ QA-style chats.
 
 # AI full disclosure
 
-* This software is developed with **strong assistance from GPT 5.5, 5.6, Claude Fable** and with humans leading the ideas, testing, and debugging. We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you. The acknowledgement below is equally important: this would not exist without `llama.cpp` and GGML, largely written by hand.
+* This software is developed with **strong assistance from AI coding agents** and with humans leading the ideas, testing, and debugging. We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you. The acknowledgement below is equally important: this would not exist without `llama.cpp` and GGML, largely written by hand.
 
 ## Acknowledgements to llama.cpp and GGML
 
@@ -66,7 +69,7 @@ notice in our `LICENSE` file.
 
 The software is currently very fast changing. Consider it beta quality.
 Before each release, a big QA run is executed, however instabilities
-are definitely possible.
+and regressions are definitely possible.
 
 # How to use this project?
 
@@ -133,6 +136,11 @@ Run each binary with `--help` for its full options.
 the token history and live model state together, shows prefill progress, and
 uses the model's native tool format. DeepSeek and GLM have their own templates.
 
+Use `/hints on` for occasional, brief explanations of the programming choices
+behind the work, and `/hints off` to stop them. Changes take effect at the next
+conversation boundary without rebuilding the cached context. New and resumed
+sessions start with hints off.
+
 Sessions are stored in `~/.ds4/kvcache`:
 
 | Command | Action |
@@ -154,13 +162,41 @@ the [client setup guide](docs/CLIENTS.md).
 
 [Models and vision](docs/MODELS.md) lists the supported downloads and memory
 requirements. DeepSeek Vision Experimental uses a different checkpoint from
-Flash 0731; GLM 5.3 Flash adds vision to the same text model.
+Flash 0731; GLM 5.3 Flash and Qwen3.8 Flash Next add vision to the same text
+model through a separate encoder.
+
+DeepSeek V4.1 Flash text and vision run on Metal; text also runs on a DGX Spark.
+Q2 runs with SSD streaming on one 128 GB Mac or Spark, or resident across two
+Macs or two Sparks using RDMA. Q4 needs SSD streaming or a 512 GB Mac.
+Engram tables remain on disk in every mode, so use a fast
+local SSD. See the [model guide](docs/MODELS.md#deepseek-v41-flash) for downloads
+and setup.
 
 With the matching encoder passed as `--vision FILE`, use `/read image.png`
 in the CLI or `view_image` in the native agent.
 
-Speculative decoding is opt-in. GLM uses `--mtp`; Flash DSpark needs a matching
-support GGUF. GLM-5.3 also supports an optional, separately obtained DFlash2
+Qwen3.8's smaller Q2 release has **41.73 GiB** of main/MTP weights,
+with imatrix IQ2_XXS gate/up experts and padded Q2_K down projections.
+It is the starting option for 64 GB Macs.
+The GGUF also contains 95.37 GiB of original BF16 n-grams, read directly
+from disk rather than loaded into RAM. Keep it on a fast SSD. Start with 8K context:
+
+```sh
+./download_model.sh qwen38-q2
+./ds4 --ctx 8192 --prefill-chunk 1024
+```
+
+The download fetches one 137.10 GiB file and updates `ds4flash.gguf`.
+Add `--mtp` for speculative decoding. The larger
+`qwen38-q4k` target is also available. Download the optional vision encoder
+with `./download_model.sh qwen38-vision` and pass it with `--vision`.
+See [Qwen setup](docs/QWEN38_FLASH_NEXT.md) for details.
+
+Speculative decoding is opt-in. GLM and Qwen use `--mtp`; V4 Flash DSpark needs a matching
+support GGUF. It can improve generation, but not every workload benefits.
+Read [speculative decoding](docs/SPECULATIVE_DECODING.md) for setup and the
+difference between default opportunistic sampling and `--mtp-exact-sampling`.
+GLM-5.3 also supports an optional, separately obtained DFlash2
 drafter. A bare startup is serial; supplying `--dflash FILE` selects the
 conservative windowed-confidence scheduler unless `--dflash-mode` says otherwise.
 Both DFlash public modes run the trained anchor-plus-seven proposal and require
@@ -171,8 +207,7 @@ Speculative continuously offers all seven draft positions whenever the causal
 context and response room permit; it has no confidence, economics, retry,
 backoff, or meter policy. DFlash is greedy-only. Speculative can be much slower
 on an unfavorable request, and either verified mode can take a numerically
-different valid continuation from the ordinary serial path. Read
-[speculative decoding](docs/SPECULATIVE_DECODING.md) for MTP/DSpark and the
+different valid continuation from the ordinary serial path. See the
 [GLM-5.3 DFlash2 guide](docs/DFLASH_GLM53.md) for the drafter recipe and startup
 policies.
 
@@ -180,13 +215,17 @@ policies.
 
 Thinking is enabled by default. Use `--nothink` or `/nothink` for direct
 answers, and `--think` or `/think` to enable it again.
+For V4.1, `ds4` and `ds4-agent` also accept
+`--think-level 25` or `/think 25`: 1 to 100 sets the reasoning effort, and
+0 disables thinking. `--think` selects 75, `--think-max` selects 100.
+Changing the level in a conversation rebuilds its cached prefix.
 The normal sampling defaults are temperature 1, top-p 1, and min-p 0.05;
 `--temp 0` selects greedy output.
 
-For DeepSeek, `--power N` trades throughput for lower sustained GPU load.
-The default is 100. GLM currently requires `--power 100`.
+For DeepSeek V4, `--power N` trades throughput for lower sustained GPU load.
+The default is 100. V4.1 and GLM currently require `--power 100`.
 
-DeepSeek Flash and GLM 5.3 Flash also support directional steering. Load a
+DeepSeek V4 Flash and GLM 5.3 Flash also support directional steering. Load a
 vector with `--dir-steering-file FILE`; `/steer F` adjusts its scale for
 subsequent tokens in a local CLI or agent session, without rebuilding the
 existing KV cache. See [steering documentation](dir-steering/README.md).
@@ -225,10 +264,11 @@ DGX Spark results, comparison conditions, and benchmark commands.
 
 ## Detailed Guides
 
-- [Models and vision](docs/MODELS.md): Flash, PRO, GLM, and matching encoders.
+- [Models and vision](docs/MODELS.md): Flash, PRO, GLM, Qwen, and matching encoders.
+- [Qwen3.8 Flash Next](docs/QWEN38_FLASH_NEXT.md): model setup, MTP, vision, and validation.
 - [SSD streaming](docs/SSD_STREAMING.md): run larger than RAM and size the cache.
 - [Inference across machines](docs/DISTRIBUTED.md): two-Mac TP/RDMA and layer pipelines.
-- [Speculative decoding](docs/SPECULATIVE_DECODING.md): DSpark, GLM MTP, and sampling.
+- [Speculative decoding](docs/SPECULATIVE_DECODING.md): DSpark, GLM and Qwen MTP, and sampling.
 - [Serving](docs/SERVER.md): APIs, images, batching, and disk KV caches.
 - [Coding agent clients](docs/CLIENTS.md): Pi, OpenCode, Codex CLI, and Claude Code.
 - [Performance](docs/PERFORMANCE.md): reproducible measurements and recorded baselines.

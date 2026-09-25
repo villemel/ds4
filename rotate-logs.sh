@@ -6,6 +6,8 @@
 # writes to a directory of its own so one noisy trial can never fill the disk
 # of the workhorse, and no model is left unrotated:
 #
+#   ds4-fleet               single shared fleet log (server.log): ALL five
+#                           models write here via fleet-server.sh plists
 #   ds4-server             legacy DeepSeek V4 Flash store (port 8000 plists in
 #                          ~/ds4/misc/swap, and the pre-launchd nohup era)
 #   ds4-glm-5.3-server     GLM 5.3 Flash workhorse, launchd
@@ -35,6 +37,7 @@ DRY_RUN="${DRY_RUN:-0}"
 DATE=$(date +%Y%m%d)
 
 LOG_DIRS=(
+    "/Users/max/Library/Logs/ds4-fleet"
     "/Users/max/Library/Logs/ds4-server"
     "/Users/max/Library/Logs/ds4-glm-5.3-server"
     "/Users/max/Library/Logs/ds4-server-glmfull"
@@ -60,13 +63,18 @@ rotate_dir() {
     fi
 
     # --- Rotate live logs (copy + truncate, server fd stays valid) ---
-    local f filepath archive size
-    for f in err.log out.log; do
-        filepath="$dir/$f"
+    # Any *.log that is not itself a dated archive rotates; this covers the
+    # per-model err.log/out.log dirs and the single fleet log
+    # (~/Library/Logs/ds4-fleet/server.log) written by all five models.
+    local f filepath base archive size
+    for f in "$dir"/*.log; do
+        base="${f##*/}"
+        case "$base" in *-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].log) continue ;; esac
+        filepath="$f"
         if [ ! -f "$filepath" ] || [ ! -s "$filepath" ]; then
             continue
         fi
-        archive="$dir/${f%.log}-$DATE.log"
+        archive="$dir/${base%.log}-$DATE.log"
         if [ -f "$archive" ]; then
             log "    skip: $(basename "$archive") already exists (already rotated today)"
             continue
@@ -78,7 +86,7 @@ rotate_dir() {
         cp "$filepath" "$archive"
         : > "$filepath"
         size=$(stat -f%z "$archive" | awk '{printf "%.1f", $1/1024}')
-        log "    rotated: $f -> ${f%.log}-$DATE.log (${size}K)"
+        log "    rotated: $base -> ${base%.log}-$DATE.log (${size}K)"
     done
 
     # --- Purge stale archives (dated archives only, never a live log) ---
@@ -91,7 +99,7 @@ rotate_dir() {
         fi
         count=$((count + 1))
     done < <(find "$dir" -maxdepth 1 \
-                 \( -name 'err-[0-9]*.log' -o -name 'out-[0-9]*.log' \) \
+                 -name '*-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].log' \
                  -mtime +"$RETENTION_DAYS" -print0)
     log "    purged $count stale archive(s) (retention: $RETENTION_DAYS days)"
 

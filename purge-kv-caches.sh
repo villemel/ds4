@@ -25,11 +25,13 @@ DRY_RUN="${1:-}"
 # only after re-checking `df -k`.
 ENVELOPE_MB=1572864   # 1.5 TiB
 
-# hours  kv-dir                                    where that instance declares its budget
+# hours  kv-dir                                    budget source (fleet-server.sh, per-model KV_SPACE_MB_<KEY>)
 TABLE="
-72 $HOME/.ds4/server-kv      $HOME/ds4/run-server.sh
-48 $HOME/.ds4-v41/server-kv  $HOME/ds4-v41/run-server.sh
-48 $HOME/.ds4-qfn/server-kv  $HOME/ds4-qfn/run-server.sh
+72 $HOME/.ds4/server-kv        $HOME/ds4/fleet-server.sh GLM53FLASH
+48 $HOME/.ds4-v4/server-kv     $HOME/ds4/fleet-server.sh DS4F
+48 $HOME/.ds4-v41/server-kv    $HOME/ds4/fleet-server.sh DS41F
+48 $HOME/.ds4-qfn/server-kv    $HOME/ds4/fleet-server.sh QWEN38FN
+48 $HOME/.ds4-glmfull/server-kv $HOME/ds4/fleet-server.sh GLM53FULL
 "
 
 # Read the budget from the launcher rather than restating it here: KV_SPACE_MB=
@@ -37,7 +39,8 @@ TABLE="
 # plist. A copy of the number in this file would drift from what the servers
 # actually enforce.
 budget_mb() {
-    { sed -n 's/^KV_SPACE_MB=\([0-9][0-9]*\).*/\1/p' "$1" 2>/dev/null
+    { sed -n "s/^KV_SPACE_MB_$2=\\([0-9][0-9]*\\).*/\\1/p" "$1" 2>/dev/null
+      sed -n 's/^KV_SPACE_MB=\\([0-9][0-9]*\\).*/\\1/p' "$1" 2>/dev/null
       awk '/--kv-disk-space-mb/ { f = 1; next }
            f && /<string>/ { gsub(/[^0-9]/, ""); if ($0 != "") { print; exit } }' "$1" 2>/dev/null
     } | head -1
@@ -47,12 +50,12 @@ total_budget_mb=0
 total_used_mb=0
 problems=0
 
-while read -r hours dir cfg _; do
+while read -r hours dir cfg key _; do
     [ -n "${dir:-}" ] || continue
     mb=$(du -sk "$dir" 2>/dev/null | cut -f1 | awk '{print int($1/1024)}')
     mb=${mb:-0}   # a store that has not run yet has no directory; report 0, keep going
     files=$(find "$dir" -maxdepth 1 -name '*.kv' -type f 2>/dev/null | wc -l | tr -d ' ')
-    budget=$(budget_mb "$cfg")
+    budget=$(budget_mb "$cfg" "$key")
     total_used_mb=$((total_used_mb + mb))
     if [ -z "$budget" ]; then
         echo "WARN  $dir: no --kv-disk-space-mb found in $cfg (unbounded?)"

@@ -5,7 +5,7 @@
 #   ds4f        DeepSeek V4 Flash 0731          ~/ds4-baseline  port 8006
 #   ds41f       DeepSeek V4.1 Flash Q2          ~/ds4-v41       port 8005
 #   glm53flash  GLM 5.3 Flash Q4_K  (workhorse) ~/ds4           port 8000
-#   glm53full   GLM 5.3 full Q4_K attn/shexp    ~/ds4-glmfull   port 8008
+#   glm53full   GLM 5.3 full slim-speed (BF16src IQ2 pool, Q4K dense)  ~/ds4-glmfull   port 8008
 #   qwen38fn    Qwen3.8 Flash Next Q4           ~/ds4-qfn       port 8007
 #
 # What it does: identifies the running ds4-server (its launchd label via the
@@ -29,6 +29,11 @@
 # Usage:
 #   fleet-server.sh <ds4f|ds41f|glm53flash|glm53full|qwen38fn> [--kv]
 #   fleet-server.sh status
+#   fleet-server.sh stop      # halt whatever is resident: boots out every
+#                             # loaded ds4 job (never plain-kill — KeepAlive
+#                             # would relaunch) and kills legacy nohup procs.
+#                             # Stays down until the next login, when the
+#                             # glm53flash LaunchAgent re-loads via RunAtLoad.
 #   DS4_FLEET_DRYRUN=1 fleet-server.sh <model> [--kv]  # write plists, print actions, no launchctl
 #   DS4_FLEET_SLEEP=<sec>                              # minimum settle sleep after bootout (default 8)
 #
@@ -67,6 +72,10 @@ KV_SPACE_MB_QWEN38FN=196608
 
 ALL_LABELS="com.ds4-glm5.3-flash.server com.ds4-glm53-full.server com.ds4-ds4f.server com.ds4-v41.server com.ds4-qfn.server"
 
+do_run() {
+    if [ "$DRYRUN" = "1" ]; then echo "DRYRUN + $*"; else "$@"; fi
+}
+
 # ---- status ----------------------------------------------------------------
 status_all() {
     echo "launchd jobs:"
@@ -80,12 +89,59 @@ status_all() {
     lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk '/ds4-serve/ {print "  pid "$2" -> "$9}' || true
 }
 
+# ---- stop ------------------------------------------------------------------
+# Halt the fleet regardless of which weights are resident. Bootout is the only
+# correct front end: KeepAlive(SuccessfulExit=false) relaunches a job whose
+# process merely dies, so killing without bootout restart-loops the server.
+stop_all() {
+    booted=""
+    for L in $ALL_LABELS; do
+        if launchctl print "$GUI/$L" >/dev/null 2>&1; then
+            do_run launchctl bootout "$GUI/$L"
+            booted="$booted $L"
+        fi
+    done
+    for pid in $(pgrep -x ds4-server || true); do
+        if [ "$DRYRUN" != "1" ]; then
+            echo "killing legacy (non-launchd) ds4-server pid $pid"
+            kill "$pid" 2>/dev/null || true
+        else
+            echo "DRYRUN + kill legacy ds4-server pid $pid"
+        fi
+    done
+    rm -f /tmp/ds4-v41-server.pid /tmp/ds4-qfn-server.pid
+
+    if [ "$DRYRUN" = "1" ]; then
+        echo "DRYRUN: would boot out:$booted"
+        return 0
+    fi
+    if [ -z "$booted" ] && ! pgrep -x ds4-server >/dev/null 2>&1; then
+        echo "nothing to stop: no ds4 launchd job loaded and no ds4-server process"
+        return 0
+    fi
+    # Same settle/wait as the switch path: launchd SIGTERMs the booted job and
+    # the huge wired mapping takes seconds to leave.
+    sleep "$MIN_SLEEP"
+    waited=$MIN_SLEEP
+    while pgrep -x ds4-server >/dev/null 2>&1; do
+        [ "$waited" -ge "$WAIT_TIMEOUT" ] && {
+            echo "ERROR: ds4-server still alive after ${waited}s — the job is booted out (it will not be relaunched) but the process is not gone" >&2
+            exit 1
+        }
+        sleep 2
+        waited=$((waited + 2))
+    done
+    echo "stopped:$booted"
+    echo "no ds4-server process; the glm53flash workhorse returns at next login (RunAtLoad)"
+}
+
 MODEL="${1:-}"
 if [ "$MODEL" = "status" ]; then status_all; exit 0; fi
+if [ "$MODEL" = "stop" ]; then stop_all; exit 0; fi
 
 WANT_KV=0
 [ "${2:-}" = "--kv" ] && WANT_KV=1
-[ "${2:-}" = "--kv" ] || [ $# -le 1 ] || { echo "usage: $0 <model> [--kv]  |  $0 status" >&2; exit 2; }
+[ "${2:-}" = "--kv" ] || [ $# -le 1 ] || { echo "usage: $0 <model> [--kv]  |  $0 status  |  $0 stop" >&2; exit 2; }
 
 # ---- per-model configuration ----------------------------------------------
 # Kept exactly as each model is run today; only the management layer (launchd,
@@ -138,7 +194,7 @@ glm53full)
     PORT=8008
     BIN="$HOME/ds4-glmfull/ds4-server"
     WD="$HOME/ds4-glmfull"
-    MODEL_GGUF="$HOME/ds4/gguf/GLM-5.3-UD-IQ2XXS-RoutedIQ2XXS-blk78Q2K-Q4Kattn-shexp.gguf"
+    MODEL_GGUF="$HOME/ds4/gguf/GLM-5.3-BF16src-RoutedIQ2XXS-blk78IQ2XXS-Q4Kattn-shexp-Q4Kslim.gguf"
     VISION=""
     CTX=450000
     BATCHED=""
@@ -165,7 +221,7 @@ status)
     ;;
 "")
     echo "usage: $0 <ds4f|ds41f|glm53flash|glm53full|qwen38fn> [--kv]" >&2
-    echo "       $0 status" >&2
+    echo "       $0 status  |  $0 stop" >&2
     exit 2
     ;;
 *)
@@ -175,10 +231,6 @@ status)
 esac
 
 PLIST_PATH="$FLEET_DIR/$LABEL.plist"
-
-do_run() {
-    if [ "$DRYRUN" = "1" ]; then echo "DRYRUN + $*"; else "$@"; fi
-}
 
 # ---- plist generation ------------------------------------------------------
 write_plist() {

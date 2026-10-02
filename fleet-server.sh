@@ -146,6 +146,10 @@ WANT_KV=0
 # ---- per-model configuration ----------------------------------------------
 # Kept exactly as each model is run today; only the management layer (launchd,
 # host binding, log/KV policy) is symmetric across the fleet.
+# ENVS: per-model A/B arm envs, space-separated KEY=VALUE, rendered into the
+# plist EnvironmentVariables (launchd never reads shell profiles). All
+# DS4_GLM_* knobs are presence-gated: =0 still enables; disable by removing.
+ENVS=""
 case "$MODEL" in
 ds4f)
     LABEL=com.ds4-ds4f.server
@@ -202,6 +206,12 @@ glm53full)
     MTP=""             # MTP measured at 0.47x resident decode — stays OFF
     KVDIR="$HOME/.ds4-glmfull/server-kv"
     KVSPACE=$KV_SPACE_MB_GLM53FULL
+    # A/B arm envs — one variable per session; ledger: ~/ds4-glmfull/misc/glm53-ab-queue.md.
+    # ARM 1 (2026-10-02): DS4_GLM_TOPK_RADIX=1 — radix streaming top-k vs the
+    # bitonic argsort+merge chain (decode + indexed prefill). Baseline all-off
+    # banked 2026-10-02; arms run glmfull-m3u eebd68d, whose banner prints
+    # binary_sha256 for era-matching.
+    ENVS="DS4_GLM_TOPK_RADIX=1"
     ;;
 qwen38fn)
     LABEL=com.ds4-qfn.server
@@ -281,6 +291,11 @@ $KVSPACE"
     fi
 
     ARG_XML=$(printf '%s\n' "$ARGS" | awk '{ printf "\t\t<string>%s</string>\n", $0 }')
+    ENV_XML=$(for _kv in $ENVS; do
+        [ -n "$_kv" ] || continue
+        _k="${_kv%%=*}" ; _v="${_kv#*=}"
+        printf '\t\t<key>%s</key>\n\t\t<string>%s</string>\n' "$_k" "$_v"
+    done)
 
     cat > "$PLIST_PATH" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -311,7 +326,7 @@ $ARG_XML	</array>
 	<dict>
 		<key>HOME</key>
 		<string>$HOME</string>
-	</dict>
+$ENV_XML	</dict>
 </dict>
 </plist>
 EOF

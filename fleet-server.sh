@@ -36,6 +36,13 @@
 #                             # glm53flash LaunchAgent re-loads via RunAtLoad.
 #   DS4_FLEET_DRYRUN=1 fleet-server.sh <model> [--kv]  # write plists, print actions, no launchctl
 #   DS4_FLEET_SLEEP=<sec>                              # minimum settle sleep after bootout (default 8)
+#   GLM53FULL_ARM=<1..6|wb|off> fleet-server.sh glm53full
+#                             # serve ONE named A/B arm WITHOUT advancing the
+#                             # queue (wb = WB stage profile; off = baseline).
+#                             # Otherwise the glm53full arm queue cycles by
+#                             # itself on every real load: 1->2->...->6->off
+#                             # (terminal). Cursor: ~/ds4/fleet/glm53full-arm;
+#                             # DRYRUN previews the arm without advancing.
 #
 # Pitfalls encoded here (see the ds4-server-fleet-ops skill):
 #   - pgrep -x, never pgrep -f ("less ds4-server.log" must not match).
@@ -87,6 +94,7 @@ status_all() {
     pgrep -lx ds4-server || echo "  no ds4-server process"
     echo "listening ports:"
     lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk '/ds4-serve/ {print "  pid "$2" -> "$9}' || true
+    echo "glm53full A/B arm queue (arm the NEXT glm53full load serves): $(cat "$FLEET_DIR/glm53full-arm" 2>/dev/null || echo 1)"
 }
 
 # ---- stop ------------------------------------------------------------------
@@ -142,6 +150,38 @@ if [ "$MODEL" = "stop" ]; then stop_all; exit 0; fi
 WANT_KV=0
 [ "${2:-}" = "--kv" ] && WANT_KV=1
 [ "${2:-}" = "--kv" ] || [ $# -le 1 ] || { echo "usage: $0 <model> [--kv]  |  $0 status  |  $0 stop" >&2; exit 2; }
+
+# ---- glm53full A/B arm queue ------------------------------------------------
+# Ledger: ~/ds4-glmfull/misc/glm53-ab-queue.md (update it after every arm
+# window). The cursor file $FLEET_DIR/glm53full-arm names the arm the NEXT
+# glm53full load serves; every successful real load advances it:
+#   1 TOPK_RADIX -> 2 INDEXER_SCORE_WIDE -> 3 CACHE_ARENA -> 4 SCRATCH 1024
+#   -> 5 PREFILL_FLUSH 8 -> 6 PREFILL_FLUSH 16 (the ledger ARM 5's second
+#   restart) -> off (baseline, all knobs off; TERMINAL — reset the cursor
+#   file to re-queue).
+# GLM53FULL_ARM=<1..6|wb|off> serves ONE named arm WITHOUT advancing the
+# cursor — that is how WB (stage profile) slots into any window.
+# KeepAlive crash-restarts re-run the loaded plist: the era continues and the
+# cursor does NOT move; only an explicit fleet-server.sh load advances it.
+# DRYRUN previews the arm and leaves the cursor untouched.
+glm53full_arm_envs() {   # $1 = arm id; echoes the KEY=VALUE list
+    case "$1" in
+    1)  echo "DS4_GLM_TOPK_RADIX=1" ;;
+    2)  echo "DS4_GLM_INDEXER_SCORE_WIDE=1" ;;
+    3)  echo "DS4_GLM_CACHE_ARENA=1" ;;
+    4)  echo "DS4_GLM_INDEXED_PREFILL_SCORE_SCRATCH_MB=1024" ;;
+    5)  echo "DS4_GLM_PREFILL_FLUSH_INTERVAL=8" ;;
+    6)  echo "DS4_GLM_PREFILL_FLUSH_INTERVAL=16" ;;
+    wb) echo "DS4_METAL_DECODE_STAGE_PROFILE=1 DS4_DECODE_PROFILE_DETAIL=1 DS4_METAL_GRAPH_PREFILL_PROFILE=1" ;;
+    *)  echo "" ;;   # off (and anything unknown) = baseline, all knobs off
+    esac
+}
+glm53full_next_arm() {   # $1 = arm id; echoes the queue successor
+    case "$1" in
+    1) echo 2 ;; 2) echo 3 ;; 3) echo 4 ;; 4) echo 5 ;; 5) echo 6 ;;
+    6) echo off ;; *) echo off ;;
+    esac
+}
 
 # ---- per-model configuration ----------------------------------------------
 # Kept exactly as each model is run today; only the management layer (launchd,
@@ -206,12 +246,20 @@ glm53full)
     MTP=""             # MTP measured at 0.47x resident decode — stays OFF
     KVDIR="$HOME/.ds4-glmfull/server-kv"
     KVSPACE=$KV_SPACE_MB_GLM53FULL
-    # A/B arm envs — one variable per session; ledger: ~/ds4-glmfull/misc/glm53-ab-queue.md.
-    # ARM 1 (2026-10-02): DS4_GLM_TOPK_RADIX=1 — radix streaming top-k vs the
-    # bitonic argsort+merge chain (decode + indexed prefill). Baseline all-off
-    # banked 2026-10-02; arms run glmfull-m3u eebd68d, whose banner prints
-    # binary_sha256 for era-matching.
-    ENVS="DS4_GLM_TOPK_RADIX=1"
+    # A/B arm envs — one variable per session; ledger:
+    # ~/ds4-glmfull/misc/glm53-ab-queue.md. ENVS come from the arm-queue
+    # cursor (see the arm-queue block above), NOT a hardcode: every glm53full
+    # load cycles to the next arm. Arms run glmfull-m3u eebd68d, whose banner
+    # prints binary_sha256 for era-matching.
+    GLM53FULL_ARM="${GLM53FULL_ARM:-}"
+    if [ -n "$GLM53FULL_ARM" ]; then
+        GLM53FULL_ARM_HOLD=1
+    else
+        GLM53FULL_ARM="$(cat "$FLEET_DIR/glm53full-arm" 2>/dev/null || true)"
+        [ -n "$GLM53FULL_ARM" ] || GLM53FULL_ARM=1
+        GLM53FULL_ARM_HOLD=0
+    fi
+    ENVS="$(glm53full_arm_envs "$GLM53FULL_ARM")"
     ;;
 qwen38fn)
     LABEL=com.ds4-qfn.server
@@ -239,6 +287,18 @@ status)
     exit 2
     ;;
 esac
+
+# Announce the glm53full A/B arm this load serves (ledger protocol: the era
+# label goes into the session notes; the startup banner confirms the binary).
+if [ "$MODEL" = "glm53full" ]; then
+    _arm_envs="$(glm53full_arm_envs "$GLM53FULL_ARM")"
+    [ -n "$_arm_envs" ] || _arm_envs="baseline (all knobs off)"
+    if [ "${GLM53FULL_ARM_HOLD:-0}" = "1" ]; then
+        echo "glm53full A/B arm $GLM53FULL_ARM (override — queue cursor NOT advanced): $_arm_envs"
+    else
+        echo "glm53full A/B arm $GLM53FULL_ARM (queue): $_arm_envs"
+    fi
+fi
 
 PLIST_PATH="$FLEET_DIR/$LABEL.plist"
 
@@ -386,6 +446,20 @@ if [ "$DRYRUN" != "1" ]; then
         echo "loaded $LABEL (port $PORT, $KVSTATE)" || \
         echo "WARNING: $LABEL not visible in launchctl print after load" >&2
     echo "weights take 45-90s to map; watch $LOGFILE for the startup banner"
+    if [ "$MODEL" = "glm53full" ]; then
+        if [ "${GLM53FULL_ARM_HOLD:-0}" = "1" ]; then
+            echo "glm53full A/B override arm $GLM53FULL_ARM served — queue cursor unchanged"
+        else
+            _next="$(glm53full_next_arm "$GLM53FULL_ARM")"
+            printf '%s\n' "$_next" >"$FLEET_DIR/glm53full-arm"
+            _next_envs="$(glm53full_arm_envs "$_next")"
+            [ -n "$_next_envs" ] || _next_envs="baseline, all knobs off"
+            echo "glm53full A/B queue cursor -> $_next — next glm53full load: $_next_envs"
+        fi
+    fi
 else
     echo "DRYRUN: plist written at $PLIST_PATH ($KVSTATE)"
+    if [ "$MODEL" = "glm53full" ]; then
+        echo "DRYRUN: A/B queue cursor NOT advanced"
+    fi
 fi

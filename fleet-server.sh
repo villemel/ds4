@@ -37,6 +37,54 @@
 #   DS4_FLEET_DRYRUN=1 fleet-server.sh <model> [--kv]  # write plists, print actions, no launchctl
 #   DS4_FLEET_SLEEP=<sec>                              # minimum settle sleep after bootout (default 8)
 #
+# WB STAGE-PROFILE RE-RUN (diagnostics-only one-off; decode-round close-out):
+#   GLM53FULL_PROFILE=wb fleet-server.sh glm53full
+# Serves the standing production set + DS4_METAL_DECODE_STAGE_PROFILE=1 for
+# exactly ONE load; the next regular glm53full load restores production.
+# NOT an arm queue (stood down at e309d04 and stays down) — a named one-off
+# profile, no cursor, no cycling.
+#
+# WHY the first attempt was aborted and treated as an error (2026-10-03, the
+# arm-1 window): the pre-fix instrument printed 1212 stage lines per decode
+# token (~5.4 MB/min, ~50 MB spoiled) and degraded decode ~13x (18.6 -> 1.4
+# t/s) because every stage boundary ran commit+wait on the forced-unfused
+# path. BOTH side effects are now accounted for by the fix (f97733d):
+#   1. LOG VOLUME is bounded: decode stages aggregate in-memory and print
+#      ONE summary line per 8 sampled tokens ("ds4: metal decode stage
+#      profile summary pos=A..B tokens=N ... part.stage=ms/tok ..."), i.e.
+#      ~1 line per 128 decoded tokens at the default 1-of-16 sampling —
+#      KB/min scale, not MB/min. DO NOT abort on log cadence.
+#   2. DECODE SPEED lands at ~10 t/s-class (vs ~18 production): one of
+#      every 16 tokens runs the instrumented unfused pass; the other 15 run
+#      the fused production path. The slowdown is the instrument's price,
+#      by design — NOT a regression. DO NOT abort on it.
+#   The only abort criteria are the standing ones: warning/error/swap/
+#   memory-pressure lines in the log.
+#
+# WHAT THE CENSUS MEASURES (so arm-1's read-error is not repeated): each
+# stage's ms is measured on the INSTRUMENTED (boundary-synced, unfused)
+# path and includes a per-boundary CPU/submit/drain overhead — absolute
+# stage SHARES are therefore biased toward boundary-heavy stages and are
+# upper bounds only. The trustworthy signals are (a) each stage's
+# ctx-SCALING (the overhead is ~ctx-independent, so per-stage growth with
+# context is real work — the pricing base for C5/C6/C7-class candidates),
+# and (b) the cross-check against the fused wall (the non-sampled tokens'
+# decode t/s in the server's own chunk lines) which prices the instrument's
+# sync tax. Prefill is NOT instrumented by this profile (the prefill-stage
+# env DS4_METAL_LAYER_STAGE_PROFILE adds per-stage sync to prefill and is
+# deliberately NOT set — prefill runs at production speed).
+#
+# OPTIONAL TUNING: DS4_METAL_DECODE_STAGE_PROFILE_SAMPLE=N (default 16;
+# 32 = faster/thinner, 8 = slower/denser). DS4_DECODE_PROFILE_DETAIL is
+# INERT on the Metal arm — never set it.
+#
+# RUN LENGTH the census needs: >=2k decoded tokens per ctx band visited,
+# spanning 10k->150k+ ctx. A normal 60-90 min session at ~10 t/s-class
+# generates 30-50k tokens and covers it (the ride-along vehicle). The
+# controlled alternative is the fixed ctx-ladder census in one stopped
+# window (~45-75 min): ~/ds4-glmfull/misc/run-glm53-wb-census.sh — see the
+# runbook header for the trade-offs and the exact ladder.
+#
 # Pitfalls encoded here (see the ds4-server-fleet-ops skill):
 #   - pgrep -x, never pgrep -f ("less ds4-server.log" must not match).
 #   - The new server takes 45-90s to map its weights; "loaded" means launchd
@@ -224,6 +272,18 @@ glm53full)
     # stay unset (all banked neutral). The banner prints binary_sha256 for
     # era-matching (parser: ~/ds4-glmfull/misc/glm53-ab-parser.py).
     ENVS="DS4_GLM_INDEXED_PREFILL_SCORE_SCRATCH_MB=8192"
+    # One-off WB census profile (header WB block above has the full
+    # instructions; NOT an arm queue — that machinery stays stood down):
+    #   GLM53FULL_PROFILE=wb fleet-server.sh glm53full
+    # serves standing + DS4_METAL_DECODE_STAGE_PROFILE=1 for exactly ONE
+    # load; any other value (or unset) serves the immutable production set.
+    case "${GLM53FULL_PROFILE:-prod}" in
+    wb) ENVS="$ENVS DS4_METAL_DECODE_STAGE_PROFILE=1" ;;
+    *)  ;;
+    esac
+    if [ "${GLM53FULL_PROFILE:-prod}" = wb ]; then
+        echo "glm53full profile: WB census — decode stage profile ON (~10 t/s-class decode, bounded log cadence; do NOT abort on either — see the header WB block)"
+    fi
     ;;
 qwen38fn)
     LABEL=com.ds4-qfn.server

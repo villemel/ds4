@@ -34,6 +34,22 @@ fi
 
 MIN_AGE_MIN=$((HOURS * 60))
 
+# A purge aimed at the wrong tree reports "Deleted 0 files" forever and looks
+# healthy. That is how 352 GiB of stale checkpoints survived 12 days: the files
+# moved from ~/.ds4/*.kv to ~/.ds4/server-kv/*.kv while the job still scanned
+# ~/.ds4 with -maxdepth 1. An empty store is legitimate (freshly purged, or a
+# trial that never ran), so the failure signature is specifically "nothing here,
+# but checkpoints live one level down". Exit 3: the caller keeps going.
+TOTAL_KV=$(find "$KV_DIR" -maxdepth 1 -name '*.kv' -type f 2>/dev/null | wc -l | tr -d ' ')
+if [ "$TOTAL_KV" = "0" ]; then
+    NESTED=$(find "$KV_DIR" -mindepth 2 -name '*.kv' -type f -print -quit 2>/dev/null)
+    if [ -n "$NESTED" ]; then
+        echo "ERROR: $KV_DIR holds no .kv files but $NESTED does: pointed one level too high." >&2
+        echo "       Pass the per-instance store dir, e.g. $KV_DIR/server-kv."
+        exit 3
+    fi
+fi
+
 if [ "$DRY_RUN" = "1" ]; then
     echo "[dry-run] Scanning $KV_DIR for KV cache files older than $HOURS hours..."
 else

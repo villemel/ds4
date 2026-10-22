@@ -98,6 +98,11 @@
 #   DS4_FLEET_SLEEP=<sec>    # minimum settle sleep after the stop (default 8)
 #   DS4_FLEET_DEBUG=1        # same as --debug
 #   DS4_FLEET_ENVS="K=V ..." # generic env substitution
+#   DS4_FLEET_ARGS="--f v ..." # one-off arg passthrough, appended LAST
+#                            # (quick arg changes without editing the case
+#                            # block; shell-parsed, auditable via DRYRUN's
+#                            # launch-script # cmd line; the argv gate still
+#                            # validates it before anything is touched)
 #   DS4_FLEET_ARM=<name>     # serve one named arm, cursor unchanged
 #   DS4_LOCK_FILE=<path>     # engine instance-lock path (default /tmp/ds4.lock);
 #                            # exported into every launch script so stop/load
@@ -545,6 +550,10 @@ build_cmd() {
         CMD="$CMD --kv-disk-dir \"$KVDIR\" --kv-disk-space-mb $KVSPACE"
         [ -n "$KV_FLAGS" ] && CMD="$CMD $KV_FLAGS"
     fi
+    # One-off arg passthrough, appended LAST so an override wins. Auditable
+    # via DRYRUN (the launch script's # cmd line); the argv gate validates
+    # it against the real binary before anything is touched.
+    [ -n "${DS4_FLEET_ARGS:-}" ] && CMD="$CMD $DS4_FLEET_ARGS"
     return 0
 }
 
@@ -605,6 +614,20 @@ write_launch_script() {
 host_bindable || die "bind address $HOST is not assigned to any local interface — refusing to launch (a wrong bind address passes every later gate and costs a full weight mapping per crash-loop round)"
 
 build_cmd
+# Spec-drafting guard: glm53full MTP is NOT production — the ONLY path to
+# spec drafting is GLM53FULL_PROFILE=mtp (the measurement vehicle). If
+# --mtp* ever reaches the final glm53full command from any other channel
+# (config edit, DS4_FLEET_ARGS, a future knob), refuse rather than serve a
+# silently spec-drafting production load. Production glm53full always
+# launches without spec drafting.
+if [ "$MODEL" = "glm53full" ] && [ "${GLM53FULL_PROFILE:-prod}" != "mtp" ]; then
+    case "$CMD" in
+    *" --mtp"*) die "glm53full production must launch without spec drafting — --mtp present outside GLM53FULL_PROFILE=mtp (offending channel: DS4_FLEET_ARGS or the per-model config)" ;;
+    esac
+fi
+if [ -n "${DS4_FLEET_ARGS:-}" ]; then
+    echo "arg override (DS4_FLEET_ARGS, appended last): $DS4_FLEET_ARGS"
+fi
 # argv gate: flag parsing happens before any model load and before the
 # instance lock — a bad flag exits nonzero without touching the resident
 # server. Run it against the real binary BEFORE halting anything.

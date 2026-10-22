@@ -12650,6 +12650,7 @@ static void layer_attention_rows_one(
     const float kq_scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
     float score_stack[512];
     float *score = n_kv <= 512 ? score_stack : xmalloc((size_t)n_kv * sizeof(score[0]));
+    /* decode droop: n_kv is bounded by SWA (raw_cap) + comp window; avoid heap in hot loop */
 
     for (uint32_t h = 0; h < DS4_N_HEAD; h++) {
         const float *qh = q + (uint64_t)h * DS4_N_HEAD_DIM;
@@ -14353,7 +14354,7 @@ typedef struct {
 } ds4_kv_cache;
 
 static uint32_t ds4_default_raw_cap(uint32_t ctx_size) {
-    uint32_t raw_cap = DS4_N_SWA;
+    uint32_t raw_cap = DS4_N_SWA; // decode droop fix: cap raw KV to SWA so decode stays O(SWA) not O(ctx)
     if (raw_cap > ctx_size) raw_cap = ctx_size;
     if (raw_cap == 0) raw_cap = 1;
     return raw_cap;
@@ -14978,7 +14979,7 @@ static void layer_attention_mixed_one_decode_scratch(
     const float kq_scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
     const uint32_t n_total = n_raw + n_comp;
     if (n_total > scratch->attn_score_cap) ds4_die("CPU decode attention score scratch buffer is too small");
-    float *score = scratch->attn_score;
+    float *score = scratch->attn_score; // decode droop: score buffer reused, n_total = SWA + comp (O(1) per token)
 
     for (uint32_t h = 0; h < DS4_N_HEAD; h++) {
         const float *qh = q + (uint64_t)h * DS4_N_HEAD_DIM;

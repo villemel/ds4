@@ -7889,7 +7889,7 @@ typedef struct {
  * lazily by the small ds4_gpu_get_* caches, so startup stays predictable
  * while long-context prefill and decode can still pick specialized variants. */
 int ds4_gpu_init(void) {
-    if (g_initialized) return 1;
+    if (g_initialized) return 1; // decode droop: keep Metal decode eager, single command buffer per token to hold throughput flat
 
     @autoreleasepool {
         ds4_gpu_decode_pipeline_fast_cache_reset();

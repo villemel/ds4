@@ -2065,6 +2065,18 @@ static bool parse_openai_content(const char **p, chat_msg *msg) {
     return true;
 }
 
+/* A must-echo client replays an assistant turn that produced no reasoning as a
+ * single space, because the hosted API rejects an empty string.  A
+ * whitespace-only body is not reasoning: rendering it emits a token between the
+ * think markers that the model never sampled, so the replayed prompt no longer
+ * re-tokenises to the cached prefix and the whole conversation is re-prefilled. */
+static bool text_is_blank(const char *s) {
+    if (!s) return true;
+    for (; *s; s++)
+        if (!isspace((unsigned char)*s)) return false;
+    return true;
+}
+
 static bool parse_messages(const char **p, chat_msgs *msgs) {
     json_ws(p);
     if (**p != '[') return false;
@@ -2102,6 +2114,10 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
                 if (!json_content_replace(p, &msg.reasoning)) {
                     free(key);
                     goto fail;
+                }
+                if (text_is_blank(msg.reasoning)) {
+                    free(msg.reasoning);
+                    msg.reasoning = NULL;
                 }
             } else if (!strcmp(key, "tool_call_id")) {
                 char *id = NULL;
@@ -12589,8 +12605,16 @@ static bool append_rendered_suffix_to_live_session(server *s, server_slot *slot,
  * it, retaining image conditioning as well. */
 static int server_generation_rewind(server *s, server_slot *slot,
                                      const request *r, int pos,
+                                     bool resample, int last_token,
                                      char *err, size_t errlen) {
     pthread_mutex_lock(&s->inference_mu);
+    /* A mode change only needs logits at the retained boundary. Replaying the
+     * previous token can cross before the verifier snapshot in exact mode. */
+    if (resample && ds4_session_rewind_speculative(slot->session, pos)) {
+        pthread_mutex_unlock(&s->inference_mu);
+        return 0;
+    }
+    if (resample) pos--;
     ds4_session_rewind(slot->session, pos);
     ds4_tokens prefix = {0};
     ds4_tokens_copy(&prefix, ds4_session_tokens(slot->session));
@@ -12599,6 +12623,8 @@ static int server_generation_rewind(server *s, server_slot *slot,
     int rc = rebuild ? server_session_sync_multimodal(s, slot, &prefix,
         r->images, r->image_count, err, errlen) : 0;
     ds4_tokens_free(&prefix);
+    if (rc == 0 && resample)
+        rc = server_eval_token(s, slot, last_token, err, errlen);
     return rc;
 }
 
@@ -14246,16 +14272,17 @@ decode_again:
             }
         }
         if (kept < ntok && !text_stop && !job_cancelled(j) && strcmp(finish, "error")) {
-            /* Logits after a rewind belong to the discarded suffix. Re-eval
-             * the last kept token before sampling under a different mode. */
-            int pos = block_start + kept - (resample ? 1 : 0);
-            if (server_generation_rewind(s, slot, &j->req, pos, err, sizeof(err)) != 0 ||
-                (resample && server_eval_token(s, slot, toks[kept - 1], err, sizeof(err)) != 0)) {
+            int pos = block_start + kept;
+            const double rewind_t0 = now_sec();
+            trace_event(s, trace_id, "speculative boundary rewind: from=%d to=%d",
+                        ds4_session_pos(slot->session), pos);
+            if (server_generation_rewind(s, slot, &j->req, pos,
+                    resample, kept ? toks[kept - 1] : 0, err, sizeof(err)) != 0) {
                 finish = "error";
                 stop_decode = true;
             } else {
-                trace_event(s, trace_id, "speculative boundary: kept=%d discarded=%d resample=%d",
-                            kept, ntok - kept, resample);
+                trace_event(s, trace_id, "speculative boundary: kept=%d discarded=%d resample=%d rewind_ms=%.3f",
+                            kept, ntok - kept, resample, (now_sec() - rewind_t0) * 1000.0);
             }
         }
         if (stop_decode) break;
@@ -18281,6 +18308,44 @@ static void test_render_think_max_prompt_prefix(void) {
 
     free(prompt);
     chat_msgs_free(&msgs);
+}
+
+/* A must-echo client replays an assistant turn that produced no reasoning as a
+ * single space, because the hosted API rejects an empty string.  A
+ * whitespace-only body is not reasoning: rendering it puts a token between
+ * <think> and </think> that the model never sampled, so the replayed prompt no
+ * longer tokenises to the cached prefix and the whole conversation is
+ * re-prefilled.  Render a blank body exactly like an absent one.
+ */
+static void test_render_blank_reasoning_is_absent(void) {
+    const char *pad_json =
+        "[{\"role\":\"user\",\"content\":\"Hello\"},"
+        "{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":\" \","
+        "\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\","
+        "\"function\":{\"name\":\"run\",\"arguments\":\"{}\"}}]}]";
+    const char *none_json =
+        "[{\"role\":\"user\",\"content\":\"Hello\"},"
+        "{\"role\":\"assistant\",\"content\":\"\","
+        "\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\","
+        "\"function\":{\"name\":\"run\",\"arguments\":\"{}\"}}]}]";
+
+    chat_msgs pad = {0}, none = {0};
+    const char *p1 = pad_json, *p2 = none_json;
+    TEST_ASSERT(parse_messages(&p1, &pad));
+    TEST_ASSERT(parse_messages(&p2, &none));
+
+    char *a = render_chat_prompt_text_for_syntax(SERVER_MODEL_SYNTAX_DEEPSEEK41,
+                                                &pad, NULL, NULL, DS4_THINK_MEDIUM);
+    char *b = render_chat_prompt_text_for_syntax(SERVER_MODEL_SYNTAX_DEEPSEEK41,
+                                                &none, NULL, NULL, DS4_THINK_MEDIUM);
+    TEST_ASSERT(a != NULL);
+    TEST_ASSERT(b != NULL);
+    TEST_ASSERT(strcmp(a, b) == 0);
+
+    free(a);
+    free(b);
+    chat_msgs_free(&pad);
+    chat_msgs_free(&none);
 }
 
 static void test_render_non_thinking_prompt_closes_think(void) {
@@ -23045,6 +23110,7 @@ static void ds4_server_unit_tests_run(void) {
     test_api_thinking_controls_parse();
     test_render_think_max_prompt_prefix();
     test_render_non_thinking_prompt_closes_think();
+    test_render_blank_reasoning_is_absent();
     test_render_drops_old_reasoning_without_tools();
     test_render_preserves_reasoning_with_tools();
     test_render_chat_prompt_text_renders_tools_before_system();

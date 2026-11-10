@@ -148,6 +148,11 @@ static id<MTLCommandBuffer> g_batch_cb;
 static id<MTLComputeCommandEncoder> g_batch_enc;
 static BOOL g_batch_encoder_concurrent;
 static BOOL g_batch_has_work;
+/* K3 on Metal (8 Nov 2026): once a K3 op has run, GPU ops encode lazily into one command batch and any host
+ * access to tensor memory (read, write) first completes the pending batch (DS4_K3_METAL_BATCH=0: every op waits). */
+static int g_k3m_batching = -1;
+static uint64_t g_k3m_epoch;   /* completed batches: a slab used in the open batch carries the current epoch */
+static int ds4_gpu_end_commands_k3(void);
 
 /* ---- Encoder timeline diagnostic (DS4_METAL_ENCODER_TIMELINE=<file>) ----
  * Gives every batch dispatch group its own compute pass with stage-boundary
@@ -2020,6 +2025,7 @@ static id<MTLCommandBuffer> ds4_gpu_new_command_buffer(void);
 static void ds4_gpu_stream_expert_cache_note_owned_created(void);
 
 static id<MTLCommandBuffer> ds4_gpu_command_buffer(int *owned) {
+    if (!g_batch_cb && g_k3m_batching == 1) (void)ds4_gpu_begin_commands();   /* K3: lazy command batch */
     if (g_batch_cb) {
         *owned = 0;
         return g_batch_cb;
@@ -5788,6 +5794,7 @@ static NSString *ds4_gpu_full_source(void) {
 
         @[@"DS4_METAL_QWEN4_SOURCE",      @"metal/qwen4.metal"],
         @[@"DS4_METAL_QWEN4_VISION_SOURCE", @"metal/qwen4_vision.metal"],
+        @[@"DS4_METAL_K3_SOURCE",         @"metal/k3.metal"],
     ];
 
     NSMutableString *source = [NSMutableString stringWithString:base];
@@ -8111,6 +8118,10 @@ int ds4_gpu_init(void) {
             }
         }
 
+        if (getenv("DS4_K3_E2M1_BITS") && strcmp(getenv("DS4_K3_E2M1_BITS"), "0") != 0) {   /* step M22 */
+            macros[@"K3_E2M1_BITS"] = @"1";
+            fprintf(stderr, "ds4: K3 on Metal: MXFP4 codes decoded by bit arithmetic (step M22)\n");
+        }
         if (drift_hc_stable)      macros[@"DS4_METAL_HC_STABLE"]          = @"1";
         if (drift_norm_unify)     macros[@"DS4_METAL_NORM_RSQRT_DISABLE"] = @"1";
         if (drift_kv_raw_f32)     macros[@"DS4_METAL_KV_RAW_F32"]         = @"1";
@@ -10626,6 +10637,7 @@ int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count)
 
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
     if (!tensor || (!data && bytes != 0)) return 0;
+    if (g_k3m_batching == 1 && g_batch_cb && !ds4_gpu_end_commands_k3()) return 0;   /* K3: the GPU work before this access first */
     DS4MetalTensor *obj = ds4_gpu_tensor_obj(tensor);
     if (offset > obj.bytes || bytes > obj.bytes - offset) return 0;
     if (bytes != 0) {
@@ -10638,6 +10650,7 @@ int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *da
 
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
     if (!tensor || (!data && bytes != 0)) return 0;
+    if (g_k3m_batching == 1 && g_batch_cb && !ds4_gpu_end_commands_k3()) return 0;   /* K3: the GPU work before this access first */
     const DS4MetalTensor *obj = ds4_gpu_tensor_const_obj(tensor);
     if (offset > obj.bytes || bytes > obj.bytes - offset) return 0;
     if (bytes != 0) {
@@ -10658,7 +10671,18 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
     if (dst_offset > d.bytes || bytes > d.bytes - dst_offset) return 0;
     if (src_offset > s.bytes || bytes > s.bytes - src_offset) return 0;
     if (bytes == 0) return 1;
-    if (!g_batch_cb) return 0;
+    if (!g_batch_cb) {   /* K3 on Metal: outside a command batch, one owned command buffer, as the compute ops do */
+        @autoreleasepool {
+            id<MTLCommandBuffer> cb = ds4_gpu_new_command_buffer();
+            if (!cb) return 0;
+            id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+            if (!blit) return 0;
+            [blit copyFromBuffer:s.buffer sourceOffset:(NSUInteger)(s.offset + src_offset)
+                        toBuffer:d.buffer destinationOffset:(NSUInteger)(d.offset + dst_offset) size:(NSUInteger)bytes];
+            [blit endEncoding];
+            return ds4_gpu_finish_command_buffer(cb, 1, "tensor copy");
+        }
+    }
 
     /* C inference callers have no surrounding autorelease pool. In particular,
      * validation-layer blit bookkeeping otherwise accumulates across tokens. */
@@ -13044,8 +13068,10 @@ int ds4_gpu_end_commands(void) {
             fprintf(stderr, "ds4: ledger window opened (prefill/warmup dropped)\n");
         }
     }
+    g_k3m_epoch++;   /* K3 on Metal: a slab used in the open batch carries the completed-batch epoch */
     return fin;
 }
+static int ds4_gpu_end_commands_k3(void) { return ds4_gpu_end_commands(); }
 
 static int ds4_gpu_flash_attn_stage_profile_boundary(
         id<MTLCommandBuffer> __strong *cbp,
@@ -64613,3 +64639,5 @@ int ds4_gpu_qwen4_hc_mix_rows_tensor(ds4_gpu_tensor *mixed, const ds4_gpu_tensor
     return qwen4_dispatch(QWEN4_K_HC_MIX_ROWS, &args, sizeof(args), b, 3,
                           MTLSizeMake((n_embd + 255) / 256, n_tokens, 1), MTLSizeMake(256, 1, 1), 0);
 }
+
+#include "ds4_metal_k3.inc"   /* Kimi K3 / K3.1 Pro on Metal */

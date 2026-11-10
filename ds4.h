@@ -416,6 +416,19 @@ int ds4_engine_metal_graph_prompt_test(ds4_engine *e, const ds4_tokens *prompt, 
 
 void ds4_tokens_push(ds4_tokens *tv, int token);
 void ds4_tokens_free(ds4_tokens *tv);
+void ds4_engine_ensure_vocab(ds4_engine *e);   /* loads the vocabulary if an inspect-only open skipped it */
+/* Kimi K3 chat: renders role/content messages into K3 prompt tokens (thinking 0 = answer directly). */
+int ds4_k3_chat_prompt(ds4_engine *e, const char *const *roles, const char *const *contents, int n, int thinking,
+                       ds4_tokens *out);
+void ds4_k3_cancel(void);   /* stops the running K3 generation after the current token */
+void ds4_k3_set_sampling(float temperature, float top_p, int top_k, uint64_t seed);   /* temperature <= 0: greedy */
+int ds4_k3_current_block(void);   /* 1 = think, 2 = response, 0/3 = other: the block of the token being emitted */
+void ds4_k3_set_tools_mode(int on);   /* 1: generation runs past the response block (a tools block may follow) to <|close|>message */
+int ds4_k3_response_closed(void);     /* tools mode: 1 once the response block closed; later tokens are emitted raw */
+int ds4_k3_special_id(ds4_engine *e, const char *spelling);   /* vocabulary id of a K3 control spelling, -1 if absent */
+void ds4_k3_note_prefix_boundary(int n_tokens);   /* step 39b: the next K3 run may checkpoint after its first n prompt tokens (0: none) */
+/* Minimal OpenAI-compatible endpoint for K3 (ds4_k3_serve.c): one request at a time, greedy. Returns on error. */
+int ds4_k3_serve(ds4_engine *e, const char *host, int port, int ctx_size, int default_max_tokens);
 void ds4_tokens_copy(ds4_tokens *dst, const ds4_tokens *src);
 bool ds4_tokens_starts_with(const ds4_tokens *tokens, const ds4_tokens *prefix);
 

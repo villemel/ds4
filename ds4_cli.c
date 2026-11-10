@@ -98,6 +98,8 @@ typedef struct {
     cli_generation_options gen;
     char *prompt_owned;
     bool inspect;
+    const char *tokenize_text;   /* --tokenize TEXT: print the token ids and pieces, no weights loaded */
+    const char *k3_serve;        /* --k3-serve HOST:PORT: minimal OpenAI-compatible endpoint for Kimi K3 */
     /* CLI flag wiring: raw argv values for --gpu-vram and --gpu-devices.
      * Resolved post-parse via parse_gpu_vram_arg(). */
     const char *gpu_vram_arg;
@@ -2348,6 +2350,10 @@ static cli_config parse_options(int argc, char **argv) {
             exit(2);
         } else if (!strcmp(arg, "--inspect")) {
             c.inspect = true;
+        } else if (!strcmp(arg, "--tokenize") && i + 1 < argc) {
+            c.tokenize_text = argv[++i];
+        } else if (!strcmp(arg, "--k3-serve") && i + 1 < argc) {
+            c.k3_serve = argv[++i];
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
         } else if (!strcmp(arg, "--server")) {
@@ -2451,7 +2457,7 @@ int main(int argc, char **argv) {
         free(cfg.prompt_owned);
         return rc;
     }
-    cfg.engine.inspect_only = cfg.inspect;
+    cfg.engine.inspect_only = cfg.inspect || cfg.tokenize_text != NULL;
     cfg.engine.first_token_test = cfg.gen.first_token_test;
     cfg.engine.metal_graph_test = cfg.gen.metal_graph_test;
     cfg.engine.context_size = cfg.gen.ctx_size;
@@ -2562,7 +2568,7 @@ int main(int argc, char **argv) {
         free(cfg.prompt_owned);
         return rc;
     }
-    if (!cfg.inspect) {
+    if (!cfg.inspect && !cfg.tokenize_text) {
         log_context_memory(cfg.engine.backend,
                            cfg.gen.ctx_size,
                            ds4_engine_prefill_chunk(engine),
@@ -2570,7 +2576,34 @@ int main(int argc, char **argv) {
         cli_warn_think_max_downgraded(&cfg.gen, "--think-max");
     }
     int rc = 0;
-    if (cfg.inspect) {
+    if (cfg.k3_serve) {
+        char host[64] = "127.0.0.1";
+        int port = 8091;
+        const char *colon = strrchr(cfg.k3_serve, ':');
+        if (colon) {
+            const size_t n = (size_t)(colon - cfg.k3_serve);
+            if (n > 0 && n < sizeof(host)) { memcpy(host, cfg.k3_serve, n); host[n] = 0; }
+            port = atoi(colon + 1);
+        } else {
+            port = atoi(cfg.k3_serve);
+        }
+        rc = ds4_k3_serve(engine, host, port, cfg.gen.ctx_size, cfg.gen.n_predict);
+    } else if (cfg.tokenize_text) {
+        ds4_engine_ensure_vocab(engine);
+        ds4_tokens tokens = {0};
+        ds4_tokenize_text(engine, cfg.tokenize_text, &tokens);
+        printf("ids:");
+        for (int i = 0; i < tokens.len; i++) printf("%s%d", i ? "," : " ", tokens.v[i]);
+        printf("\npieces:");
+        for (int i = 0; i < tokens.len; i++) {
+            size_t len = 0;
+            char *piece = ds4_token_text(engine, tokens.v[i], &len);
+            printf(" [%.*s]", (int)len, piece ? piece : "");
+            free(piece);
+        }
+        printf("\n");
+        ds4_tokens_free(&tokens);
+    } else if (cfg.inspect) {
         ds4_engine_summary(engine);
     } else if (cfg.gen.imatrix_output_path) {
         rc = ds4_engine_collect_imatrix(engine,
